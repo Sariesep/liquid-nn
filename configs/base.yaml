@@ -1,0 +1,30 @@
+# MiniLiquidGPT — Varsayılan konfigürasyon
+# Colab T4 (16GB) veya RTX 3060+ için
+
+model:
+  vocab_size: 50257      # tiktoken gpt2
+  embed_dim: 256
+  num_fast: 2            # Hızlı katman (Euler, plast OFF)
+  num_deep: 2            # Derin katman (RK2, Hebb ON)
+  fast_steps: 1
+  deep_steps: 3
+  dropout: 0.1
+  max_seq: 512
+
+training:
+  epochs: 10
+  batch_size: 8
+  lr: 1.0e-3
+  chunk_size: 16         # Truncated BPTT
+  grad_clip: 1.0
+  weight_decay: 1.0e-4
+  plast_lr_mult: 3.0     # Plastisite parametreleri için LR çarpanı
+  phase_split: 0.5       # İlk %50 plast OFF, son %50 plast ON
+
+data:
+  max_tokens: 200000
+  seq_len: 128
+
+save:
+  dir: ./checkpoints/
+  save_every: 2          # Her N epoch'ta kaydet

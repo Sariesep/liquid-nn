@@ -1,0 +1,30 @@
+# MiniLiquidGPT — Colab T4 optimize
+# Ücretsiz Colab'da güvenli çalışır
+
+model:
+  vocab_size: 50257
+  embed_dim: 256
+  num_fast: 2
+  num_deep: 2
+  fast_steps: 1
+  deep_steps: 3
+  dropout: 0.1
+  max_seq: 512
+
+training:
+  epochs: 10
+  batch_size: 8
+  lr: 1.0e-3
+  chunk_size: 16
+  grad_clip: 1.0
+  weight_decay: 1.0e-4
+  plast_lr_mult: 3.0
+  phase_split: 0.5
+
+data:
+  max_tokens: 200000
+  seq_len: 128
+
+save:
+  dir: /content/drive/MyDrive/LiquidGPT_Models/
+  save_every: 2

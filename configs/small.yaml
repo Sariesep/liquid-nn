@@ -1,0 +1,30 @@
+# MiniLiquidGPT — Küçük model (hızlı deney)
+# CPU'da bile çalışır, ~5 dakikada eğitilir
+
+model:
+  vocab_size: 50257
+  embed_dim: 128
+  num_fast: 1
+  num_deep: 1
+  fast_steps: 1
+  deep_steps: 2
+  dropout: 0.1
+  max_seq: 256
+
+training:
+  epochs: 5
+  batch_size: 16
+  lr: 2.0e-3
+  chunk_size: 16
+  grad_clip: 1.0
+  weight_decay: 1.0e-4
+  plast_lr_mult: 3.0
+  phase_split: 0.4
+
+data:
+  max_tokens: 50000
+  seq_len: 64
+
+save:
+  dir: ./checkpoints/
+  save_every: 2
