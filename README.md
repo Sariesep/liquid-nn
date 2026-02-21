@@ -1,6 +1,6 @@
-# 🧠 Liquid Neural Networks — Plastik Sinapslarla Gerçek Zamanlı Öğrenme
+# 🧠 Liquid Neural Networks — Real-Time Learning with Plastic Synapses
 
-> **GPT/Gemini statiktir. Eğitimi biter, donar. Bu model canlıdır — her token'da sinapslarını değiştirir.**
+> **GPT/Gemini are static. Training ends, they freeze. This model is alive — it changes its synapses on every token.**
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PyTorch 2.0+](https://img.shields.io/badge/pytorch-2.0%2B-red.svg)](https://pytorch.org/)
@@ -9,92 +9,92 @@
 
 ---
 
-## 🔬 Bu Nedir?
+## 🔬 What Is This?
 
-Sıfırdan yazılmış, Liquid Time-Constant Networks + Differentiable Hebbian Plasticity tabanlı bir dil modeli araştırma projesi.
+A language model research project built from scratch, based on Liquid Time-Constant Networks + Differentiable Hebbian Plasticity.
 
-### Transformer'lardan Farkımız
+### How We Differ from Transformers
 
-| | Transformer (GPT/Gemini) | Liquid Neural Network (Biz) |
+| | Transformer (GPT/Gemini) | Liquid Neural Network (Ours) |
 |---|---|---|
-| **Sinapslar** | Sabit (eğitim sonrası donar) | Plastik (her token'da güncellenir) |
-| **Hafıza** | Context window (geçici) | Hebbian izler (kalıcı) |
-| **Adaptasyon** | Fine-tune gerekir (saatler) | Gerçek zamanlı (milisaniyeler) |
-| **Hesaplama** | Sabit derinlik | Adaptif ODE adımları (kolay→hızlı, zor→derin) |
+| **Synapses** | Fixed (freeze after training) | Plastic (updated on every token) |
+| **Memory** | Context window (temporary) | Hebbian traces (persistent) |
+| **Adaptation** | Requires fine-tuning (hours) | Real-time (milliseconds) |
+| **Computation** | Fixed depth | Adaptive ODE steps (easy→fast, hard→deep) |
 
-### Mimari
+### Architecture
 
 ```
 Token → Embed(50257, 256) + SinPosEnc
-  → LiquidODE × 2 (steps=1, Euler — hızlı algı)
-  → LiquidODE × 2 (steps=3, RK2 + Hebb — derin düşünce)
+  → LiquidODE × 2 (steps=1, Euler — fast perception)
+  → LiquidODE × 2 (steps=3, RK2 + Hebb — deep reasoning)
   → Head (weight-tied) → Logits
 ```
 
-## 🚀 Hızlı Başlangıç
+## 🚀 Quick Start
 
 ```bash
-# Klonla
-git clone https://github.com/KULLANICI_ADIN/liquid-nn.git
+# Clone
+git clone https://github.com/YOUR_USERNAME/liquid-nn.git
 cd liquid-nn
 
-# Bağımlılıkları kur
+# Install dependencies
 pip install -r requirements.txt
 
-# Eğit (Colab T4 veya yerel GPU)
+# Train (Colab T4 or local GPU)
 python scripts/train.py --config configs/base.yaml
 
-# Metin üret
+# Generate text
 python scripts/generate.py --checkpoint checkpoints/best_model.pt --prompt "The meaning of life"
 
-# Plastisite testi
+# Plasticity test
 python scripts/plasticity_test.py --checkpoint checkpoints/best_model.pt
 ```
 
-### Google Colab'da Çalıştır
+### Run on Google Colab
 
 ```python
-!git clone https://github.com/KULLANICI_ADIN/liquid-nn.git
+!git clone https://github.com/YOUR_USERNAME/liquid-nn.git
 %cd liquid-nn
 !pip install -r requirements.txt
 !python scripts/train.py --config configs/colab_t4.yaml
 ```
 
-## 📁 Proje Yapısı
+## 📁 Project Structure
 
 ```
 liquid-nn/
-├── liquidnn/                # Ana kütüphane (pip install edilebilir)
+├── liquidnn/                # Main library (pip installable)
 │   ├── __init__.py
-│   ├── plasticity.py        # PlasticSynapse — Hebbian öğrenme
-│   ├── ode_cell.py          # LiquidODECell — Sıvı nöron
-│   ├── model.py             # MiniLiquidGPT — Ana model
-│   ├── tokenizer.py         # tiktoken sarmalayıcı
-│   └── utils.py             # Yardımcı fonksiyonlar
-├── configs/                 # Eğitim konfigürasyonları
-│   ├── base.yaml            # Varsayılan ayarlar
-│   ├── colab_t4.yaml        # Colab T4 optimize
-│   ├── small.yaml           # Hızlı deney (~5M param)
-│   └── large.yaml           # Büyük model (~50M param)
-├── scripts/                 # Çalıştırılabilir scriptler
-│   ├── train.py             # Eğitim
-│   ├── generate.py          # Metin üretimi
-│   ├── plasticity_test.py   # ZEPHYR / Bloop testi
-│   └── benchmark.py         # Performans ölçümü
-├── data/                    # Veri yükleme
+│   ├── plasticity.py        # PlasticSynapse — Hebbian learning
+│   ├── ode_cell.py          # LiquidODECell — Liquid neuron
+│   ├── model.py             # MiniLiquidGPT — Main model
+│   ├── tokenizer.py         # tiktoken wrapper
+│   └── utils.py             # Utility functions
+├── configs/                 # Training configurations
+│   ├── base.yaml            # Default settings
+│   ├── colab_t4.yaml        # Colab T4 optimized
+│   ├── small.yaml           # Quick experiments (~5M params)
+│   └── large.yaml           # Large model (~50M params)
+├── scripts/                 # Executable scripts
+│   ├── train.py             # Training
+│   ├── generate.py          # Text generation
+│   ├── plasticity_test.py   # ZEPHYR / Bloop test
+│   └── benchmark.py         # Performance measurement
+├── data/                    # Data loading
 │   └── loader.py
-├── tests/                   # Unit testler
+├── tests/                   # Unit tests
 │   ├── test_plasticity.py
 │   ├── test_ode_cell.py
 │   └── test_model.py
-├── notebooks/               # Jupyter notebook'lar
+├── notebooks/               # Jupyter notebooks
 │   ├── 01_quickstart.ipynb
 │   ├── 02_plasticity_demo.ipynb
 │   └── 03_training.ipynb
-├── docs/                    # Dokümantasyon
+├── docs/                    # Documentation
 │   ├── architecture.md
 │   └── plasticity.md
-├── checkpoints/             # Model ağırlıkları (git'te yok)
+├── checkpoints/             # Model weights (not in git)
 ├── requirements.txt
 ├── setup.py
 ├── pyproject.toml
@@ -103,33 +103,33 @@ liquid-nn/
 └── README.md
 ```
 
-## 📊 Sonuçlar
+## 📊 Results
 
-| Metrik | Değer |
+| Metric | Value |
 |---|---|
-| Parametreler | ~14M |
+| Parameters | ~14M |
 | Val Perplexity | ... |
-| Plastisite ON vs OFF | ... |
-| ZEPHYR Kalıcılık | ... |
+| Plasticity ON vs OFF | ... |
+| ZEPHYR Persistence | ... |
 
-*Sonuçlar eğitim tamamlandıkça güncellenecek.*
+*Results will be updated as training completes.*
 
-## 🔬 Araştırma Notları
+## 🔬 Research Notes
 
-Bu proje şu makalelerden ilham alır:
+This project is inspired by the following papers:
 - [Liquid Time-constant Networks](https://arxiv.org/abs/2006.04439) (Hasani et al., 2020)
 - [Differentiable Plasticity](https://arxiv.org/abs/1804.02464) (Miconi et al., 2018)
 - [Neural ODEs](https://arxiv.org/abs/1806.07366) (Chen et al., 2018)
 
-## 📝 Lisans
+## 📝 License
 
-MIT License — İstediğin gibi kullan, geliştir, paylaş.
+MIT License — Use, modify, and share as you like.
 
-## 🤝 Katkı
+## 🤝 Contributing
 
-Pull request'ler açıktır! Özellikle şu konularda yardım aranıyor:
-- [ ] Daha büyük veri setleri (TinyStories, Cosmopedia)
+Pull requests are welcome! Help is especially needed on:
+- [ ] Larger datasets (TinyStories, Cosmopedia)
 - [ ] Multi-head plasticity
-- [ ] Benchmark karşılaştırmaları (GPT-2 small vs Liquid)
+- [ ] Benchmark comparisons (GPT-2 small vs Liquid)
 - [ ] ONNX/TensorRT export
-- [ ] Mobil deployment (CoreML, NNAPI)
+- [ ] Mobile deployment (CoreML, NNAPI)
