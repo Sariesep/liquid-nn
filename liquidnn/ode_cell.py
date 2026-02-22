@@ -51,7 +51,8 @@ class LiquidODECell(nn.Module):
 
     def forward(self, x: torch.Tensor, h: torch.Tensor,
                 enable_plasticity: bool = True,
-                adaptive_steps: bool = False) -> torch.Tensor:
+                adaptive_steps: bool = False,
+                tau_gate_residual: bool = False) -> torch.Tensor:
         """
         Tek token işle.
 
@@ -60,34 +61,43 @@ class LiquidODECell(nn.Module):
             h: [B, H]     önceki gizli durum
             enable_plasticity: Hebb güncellemesi yapılsın mı
             adaptive_steps: True → tau değerine göre adım sayısı dinamik seç
+            tau_gate_residual: True → tau değeri residual gating'i kontrol eder
 
         Returns:
             [B, H] yeni gizli durum
         """
-        # Adım sayısını belirle
-        steps = self.ode_steps
-        if adaptive_steps and self.ode_steps > 1:
-            # tau_net ile girdi zorluğunu ölç
+        # Tau hesapla (adaptive steps ve/veya gating için)
+        tau = None
+        if adaptive_steps or tau_gate_residual:
             tau = self.tau_net(torch.cat([x, h], dim=-1)) + self.tau_min
             mean_tau = tau.mean().item()
+
+        # Adım sayısını belirle
+        steps = self.ode_steps
+        if adaptive_steps and self.ode_steps > 1 and tau is not None:
             if mean_tau < 0.5:
-                steps = 1       # Kolay → Euler
+                steps = 1
             elif mean_tau < 1.0:
-                steps = 2       # Orta → hafif RK2
-            # else: tam ode_steps
+                steps = 2
 
         dt = 1.0 / max(steps, 1)
 
+        h_input = h  # residual için sakla
+
         if steps <= 1:
-            # Euler — hızlı
             h = h + dt * self._dynamics(h, x)
         else:
-            # RK2 Midpoint
             for _ in range(steps):
                 k1 = self._dynamics(h, x)
                 h_mid = h + 0.5 * dt * k1
                 k2 = self._dynamics(h_mid, x)
                 h = h + dt * k2
+
+        # Tau-Gated Residual: kolay → güçlü skip, zor → tam ODE
+        if tau_gate_residual and tau is not None:
+            # sigmoid(1/mean_tau): tau küçük → gate yüksek → daha çok skip
+            gate = torch.sigmoid(1.0 / (tau.mean(dim=-1, keepdim=True) + 1e-6) - 1.0)
+            h = gate * h_input + (1 - gate) * h
 
         if enable_plasticity and self.use_plasticity:
             self.syn_ih.update_hebb(x, h)

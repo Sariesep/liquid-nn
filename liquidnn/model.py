@@ -172,7 +172,9 @@ class MiniLiquidGPT(nn.Module):
                  adaptive_ode: bool = False,
                  early_exit_threshold: float = 0.0,
                  use_rope: bool = False,
-                 use_flash: bool = True):
+                 use_flash: bool = True,
+                 use_multiscale: bool = False,
+                 tau_gate: bool = False):
         super().__init__()
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
@@ -182,6 +184,8 @@ class MiniLiquidGPT(nn.Module):
         self.use_rmsnorm = use_rmsnorm
         self.adaptive_ode = adaptive_ode
         self.early_exit_threshold = early_exit_threshold
+        self.use_multiscale = use_multiscale
+        self.tau_gate = tau_gate
 
         # Norm sınıfı seçimi
         NormClass = RMSNorm if use_rmsnorm else nn.LayerNorm
@@ -234,6 +238,14 @@ class MiniLiquidGPT(nn.Module):
             )
 
         self._hiddens: Optional[List[torch.Tensor]] = None
+
+        # Multi-Scale Fusion: fast ve deep çıktılarını birleştiren gate
+        self._fusion_gate = None
+        if use_multiscale and num_fast > 0 and num_deep > 0:
+            self._fusion_gate = nn.Sequential(
+                nn.Linear(embed_dim * 2, embed_dim),
+                nn.Sigmoid()
+            )
 
     @staticmethod
     def _make_sinusoidal_pe(max_len: int, dim: int) -> torch.Tensor:
@@ -299,25 +311,63 @@ class MiniLiquidGPT(nn.Module):
                     out[b:b+1] += weights[b, k_idx] * h_new
             x = out
         else:
-            # Standart sıralı katmanlar
-            for i, (cell, norm, drop) in enumerate(
-                    zip(self.cells, self.norms, self.drops)):
-                h_new = cell(x, self._hiddens[i], enable_plasticity,
-                             adaptive_steps=self.adaptive_ode)
-                h_new = norm(h_new + x)  # Residual + LayerNorm/RMSNorm
-                h_new = drop(h_new)
-                self._hiddens[i] = h_new
-                x = h_new
+            # Multi-Scale Fusion veya standart sıralı katmanlar
+            if self.use_multiscale and self._fusion_gate is not None:
+                # Fast ve deep katmanları paralel çalıştır
+                fast_cells = [(i, c, n, d) for i, (c, n, d) in enumerate(
+                    zip(self.cells, self.norms, self.drops))
+                    if not c.use_plasticity]
+                deep_cells = [(i, c, n, d) for i, (c, n, d) in enumerate(
+                    zip(self.cells, self.norms, self.drops))
+                    if c.use_plasticity]
 
-                # Early Exit: güven yeterince yüksekse geri kalan katmanları atla
-                if (self.early_exit_threshold > 0 and
-                        not self.training and
-                        i < self.num_layers - 1):
-                    early_logits = F.linear(self.out_norm(x),
-                                            self.embed.weight)
-                    confidence = F.softmax(early_logits, dim=-1).max(dim=-1).values.mean()
-                    if confidence.item() > self.early_exit_threshold:
-                        break
+                # Fast path
+                x_fast = x
+                for i, cell, norm, drop in fast_cells:
+                    h_new = cell(x_fast, self._hiddens[i], enable_plasticity,
+                                 adaptive_steps=self.adaptive_ode,
+                                 tau_gate_residual=self.tau_gate)
+                    h_new = norm(h_new + x_fast)
+                    h_new = drop(h_new)
+                    self._hiddens[i] = h_new
+                    x_fast = h_new
+
+                # Deep path
+                x_deep = x
+                for i, cell, norm, drop in deep_cells:
+                    h_new = cell(x_deep, self._hiddens[i], enable_plasticity,
+                                 adaptive_steps=self.adaptive_ode,
+                                 tau_gate_residual=self.tau_gate)
+                    h_new = norm(h_new + x_deep)
+                    h_new = drop(h_new)
+                    self._hiddens[i] = h_new
+                    x_deep = h_new
+
+                # Fusion: fast ve deep çıktılarını birleştir
+                gate = self._fusion_gate(torch.cat([x_fast, x_deep], dim=-1))
+                x = gate * x_fast + (1 - gate) * x_deep
+
+            else:
+                # Standart sıralı katmanlar
+                for i, (cell, norm, drop) in enumerate(
+                        zip(self.cells, self.norms, self.drops)):
+                    h_new = cell(x, self._hiddens[i], enable_plasticity,
+                                 adaptive_steps=self.adaptive_ode,
+                                 tau_gate_residual=self.tau_gate)
+                    h_new = norm(h_new + x)
+                    h_new = drop(h_new)
+                    self._hiddens[i] = h_new
+                    x = h_new
+
+                    # Early Exit
+                    if (self.early_exit_threshold > 0 and
+                            not self.training and
+                            i < self.num_layers - 1):
+                        early_logits = F.linear(self.out_norm(x),
+                                                self.embed.weight)
+                        confidence = F.softmax(early_logits, dim=-1).max(dim=-1).values.mean()
+                        if confidence.item() > self.early_exit_threshold:
+                            break
 
         # Sliding-Window Attention (etkinse)
         if self.attn is not None:
@@ -371,6 +421,7 @@ class MiniLiquidGPT(nn.Module):
     @torch.no_grad()
     def generate(self, prompt_ids: torch.Tensor, max_new: int = 80,
                  temperature: float = 0.8, top_k: int = 40,
+                 top_p: float = 0.0, repetition_penalty: float = 1.0,
                  enable_plasticity: bool = True) -> torch.Tensor:
         """
         Metin üret.
@@ -379,7 +430,9 @@ class MiniLiquidGPT(nn.Module):
             prompt_ids: [T] veya [1, T] token ID'leri
             max_new: Üretilecek token sayısı
             temperature: Örnekleme sıcaklığı
-            top_k: Top-k filtreleme
+            top_k: Top-k filtreleme (0 = devre dışı)
+            top_p: Top-p (nucleus) filtreleme (0 = devre dışı)
+            repetition_penalty: Tekrar cezası (1.0 = devre dışı, >1 = ceza)
             enable_plasticity: Hebb aktif mi
 
         Returns:
@@ -395,18 +448,41 @@ class MiniLiquidGPT(nn.Module):
 
         ids = prompt_ids.clone()
 
-        # Prompt'u işle
+        # Prompt'ı işle
         for t in range(ids.size(1)):
             logits = self.forward_token(ids[:, t], t, enable_plasticity)
 
         # Üret
         for step in range(max_new):
             pos = ids.size(1)
+
+            # Repetition Penalty: önceki tokenlerin logit'lerini cezalandır
+            if repetition_penalty != 1.0:
+                for b in range(B):
+                    prev_tokens = ids[b].unique()
+                    for tok_id in prev_tokens:
+                        if logits[b, tok_id] > 0:
+                            logits[b, tok_id] /= repetition_penalty
+                        else:
+                            logits[b, tok_id] *= repetition_penalty
+
             scaled = logits / temperature
 
+            # Top-k filtreleme
             if top_k > 0:
                 v, _ = torch.topk(scaled, min(top_k, scaled.size(-1)))
                 scaled[scaled < v[:, [-1]]] = -float('inf')
+
+            # Top-p (nucleus) filtreleme
+            if top_p > 0.0:
+                sorted_logits, sorted_idx = torch.sort(scaled, descending=True)
+                cum_probs = torch.cumsum(
+                    F.softmax(sorted_logits, dim=-1), dim=-1)
+                # Eşik üzerindeki tokenleri kaldır
+                remove_mask = cum_probs - F.softmax(sorted_logits, dim=-1) >= top_p
+                sorted_logits[remove_mask] = -float('inf')
+                # Orijinal sıralamaya geri dön
+                scaled = sorted_logits.scatter(1, sorted_idx, sorted_logits)
 
             probs = F.softmax(scaled, dim=-1)
             next_id = torch.multinomial(probs, 1)
