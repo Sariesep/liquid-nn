@@ -43,6 +43,7 @@ class PlasticSynapse(nn.Module):
         self.alpha = nn.Parameter(0.01 * torch.randn(out_dim, in_dim))
         self.log_eta = nn.Parameter(torch.tensor(-3.0))
         self.logit_decay = nn.Parameter(torch.tensor(3.0))
+        self.hebb_capacity = nn.Parameter(torch.tensor(1.0))
 
         # Plastik iz
         self.register_buffer('Hebb', None)
@@ -55,12 +56,14 @@ class PlasticSynapse(nn.Module):
         return F.linear(x, W_eff, self.b)
 
     @torch.no_grad()
-    def update_hebb(self, pre: torch.Tensor, post: torch.Tensor):
+    def update_hebb(self, pre: torch.Tensor, post: torch.Tensor,
+                    moe_weight: float = 1.0):
         """
         Hebbian güncelleme (opsiyonel top-k sparsification ile).
 
         pre:  Presinaptik aktivasyon [B, in_dim]
         post: Postsinaptik aktivasyon [B, out_dim]
+        moe_weight: Bu expert'in seçilme ağırlığı (MoE router'dan gelir)
         """
         decay = torch.sigmoid(self.logit_decay)
         eta = F.softplus(self.log_eta) * 0.03
@@ -70,11 +73,18 @@ class PlasticSynapse(nn.Module):
         else:
             outer = torch.outer(post.squeeze(), pre.squeeze())
 
+        # MoE ağırlığı ile plastisiteyi ölçeklendir
+        outer = outer * moe_weight
+
+        if self.Hebb is None:
+            self.Hebb = torch.zeros(self.out_dim, self.in_dim,
+                                    device=pre.device, dtype=pre.dtype)
+
         self.Hebb = decay * self.Hebb + eta * outer
 
-        # Norm sınırı
+        # Öğrenilebilir norm sınırı
         h_norm = self.Hebb.norm()
-        max_norm = 0.3 * self.W.data.norm()
+        max_norm = F.softplus(self.hebb_capacity)
         if h_norm > max_norm:
             self.Hebb = self.Hebb * (max_norm / (h_norm + 1e-8))
 

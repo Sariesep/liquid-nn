@@ -52,7 +52,8 @@ class LiquidODECell(nn.Module):
     def forward(self, x: torch.Tensor, h: torch.Tensor,
                 enable_plasticity: bool = True,
                 adaptive_steps: bool = False,
-                tau_gate_residual: bool = False) -> torch.Tensor:
+                tau_gate_residual: bool = False,
+                moe_weight: float = 1.0) -> torch.Tensor:
         """
         Tek token işle.
 
@@ -62,6 +63,7 @@ class LiquidODECell(nn.Module):
             enable_plasticity: Hebb güncellemesi yapılsın mı
             adaptive_steps: True → tau değerine göre adım sayısı dinamik seç
             tau_gate_residual: True → tau değeri residual gating'i kontrol eder
+            moe_weight: Bu hücrenin seçilme ağırlığı (MoE'dan gelir, plastisiteyi ölçekler)
 
         Returns:
             [B, H] yeni gizli durum
@@ -83,25 +85,32 @@ class LiquidODECell(nn.Module):
         dt = 1.0 / max(steps, 1)
 
         h_input = h  # residual için sakla
+        step_moe_weight = moe_weight / steps  # Toplam Hebbian birikimini normalleştir
+
+        target_update = enable_plasticity and self.use_plasticity
 
         if steps <= 1:
             h = h + dt * self._dynamics(h, x)
+            if target_update:
+                self.syn_ih.update_hebb(x, h, moe_weight=step_moe_weight)
+                self.syn_hh.update_hebb(h, h, moe_weight=step_moe_weight)
         else:
             for _ in range(steps):
                 k1 = self._dynamics(h, x)
                 h_mid = h + 0.5 * dt * k1
+
+                # Sürekli Plastisite: Zaman entegrasyonu ortasında Hebb güncellemesi
+                if target_update:
+                    self.syn_ih.update_hebb(x, h_mid, moe_weight=step_moe_weight)
+                    self.syn_hh.update_hebb(h_mid, h_mid, moe_weight=step_moe_weight)
+
                 k2 = self._dynamics(h_mid, x)
                 h = h + dt * k2
 
         # Tau-Gated Residual: kolay → güçlü skip, zor → tam ODE
         if tau_gate_residual and tau is not None:
-            # sigmoid(1/mean_tau): tau küçük → gate yüksek → daha çok skip
             gate = torch.sigmoid(1.0 / (tau.mean(dim=-1, keepdim=True) + 1e-6) - 1.0)
             h = gate * h_input + (1 - gate) * h
-
-        if enable_plasticity and self.use_plasticity:
-            self.syn_ih.update_hebb(x, h)
-            self.syn_hh.update_hebb(h, h)
 
         return h
 

@@ -304,10 +304,17 @@ class MiniLiquidGPT(nn.Module):
                     drop = self.drops[eidx]
                     h_new = cell(x[b:b+1], self._hiddens[eidx][b:b+1],
                                  enable_plasticity,
-                                 adaptive_steps=self.adaptive_ode)
+                                 adaptive_steps=self.adaptive_ode,
+                                 tau_gate_residual=self.tau_gate,
+                                 moe_weight=weights[b, k_idx].item())
                     h_new = norm(h_new + x[b:b+1])
                     h_new = drop(h_new)
-                    self._hiddens[eidx][b:b+1] = h_new
+
+                    # In-place hatasını önlemek için clone() kullan
+                    new_h = self._hiddens[eidx].clone()
+                    new_h[b:b+1] = h_new
+                    self._hiddens[eidx] = new_h
+
                     out[b:b+1] += weights[b, k_idx] * h_new
             x = out
         else:

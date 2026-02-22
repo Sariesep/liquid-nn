@@ -7,7 +7,7 @@ Liquid ODE Cells + Differentiable Hebbian Plasticity
 + Gradient Checkpointing + INT8 Quantization
 """
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"
 
 from .plasticity import PlasticSynapse
 from .ode_cell import LiquidODECell
