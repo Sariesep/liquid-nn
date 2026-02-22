@@ -19,6 +19,22 @@ import torch.nn.functional as F
 from .ode_cell import LiquidODECell
 
 
+def _greedy_pick(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
+    """
+    Logits'ten greedy (argmax) token seçimi.
+
+    Args:
+        logits: [B, V] logit tensörü
+        temperature: Sıcaklık (burada greedy olduğu için sadece scaling)
+
+    Returns:
+        [B, 1] seçilen token ID'leri
+    """
+    if temperature != 1.0 and temperature > 0:
+        logits = logits / temperature
+    return logits.argmax(dim=-1, keepdim=True)
+
+
 class MiniLiquidGPT(nn.Module):
     """
     Sıvı Nöral Ağ Dil Modeli.
@@ -210,6 +226,273 @@ class MiniLiquidGPT(nn.Module):
         """Tüm plastik izleri sıfırla."""
         for cell in self.cells:
             cell.reset_hebb()
+
+    # ── State Management (Speculative Decoding için) ──────────────
+
+    def save_state(self) -> dict:
+        """
+        Modelin tüm mutable durumunu snapshot olarak döndür.
+
+        Kopyalanan durumlar:
+          - self._hiddens  (katman başına gizli durum tensörleri)
+          - Her LiquidODECell'in syn_ih.Hebb ve syn_hh.Hebb matrisleri
+
+        Tüm tensörler .detach().clone() ile hesaplama grafiğinden koparılır;
+        böylece geri yükleme sırasında VRAM sızıntısı önlenir.
+        """
+        saved_hiddens = None
+        if self._hiddens is not None:
+            saved_hiddens = [h.detach().clone() for h in self._hiddens]
+
+        saved_hebbs = []
+        for cell in self.cells:
+            pair = {}
+            pair['ih'] = (cell.syn_ih.Hebb.detach().clone()
+                          if cell.syn_ih.Hebb is not None else None)
+            pair['hh'] = (cell.syn_hh.Hebb.detach().clone()
+                          if cell.syn_hh.Hebb is not None else None)
+            saved_hebbs.append(pair)
+
+        return {'hiddens': saved_hiddens, 'hebbs': saved_hebbs}
+
+    def restore_state(self, state_dict: dict):
+        """
+        save_state() ile kaydedilmiş durumu geri yükle.
+
+        Reject durumunda ana modeli kabul edilen son tokenin
+        state'ine geri döndürmek için kullanılır.
+        """
+        if state_dict['hiddens'] is not None:
+            self._hiddens = [h.detach().clone()
+                             for h in state_dict['hiddens']]
+        else:
+            self._hiddens = None
+
+        for cell, pair in zip(self.cells, state_dict['hebbs']):
+            cell.syn_ih.Hebb = (pair['ih'].detach().clone()
+                                if pair['ih'] is not None else None)
+            cell.syn_hh.Hebb = (pair['hh'].detach().clone()
+                                if pair['hh'] is not None else None)
+
+    # ── Draft Model Factory ───────────────────────────────────────
+
+    @classmethod
+    def create_draft_model(cls, target_model: 'MiniLiquidGPT',
+                           device: torch.device = None) -> 'MiniLiquidGPT':
+        """
+        Ana modelden hafif bir draft model oluştur.
+
+        - 1 hızlı katman (Euler, PlasticSynapse OFF)
+        - Embedding ağırlıkları ana modelden paylaşılır (VRAM tasarrufu)
+
+        Args:
+            target_model: Kaynak ana model
+            device: Hedef cihaz (None → target_model.embed.weight.device)
+
+        Returns:
+            Hafif MiniLiquidGPT draft modeli
+        """
+        if device is None:
+            device = target_model.embed.weight.device
+
+        draft = cls(
+            vocab_size=target_model.vocab_size,
+            embed_dim=target_model.embed_dim,
+            num_fast=1,
+            num_deep=0,            # plastisite tamamen kapalı
+            fast_steps=1,
+            deep_steps=1,
+            dropout=0.0,           # draft model'de dropout gereksiz
+        ).to(device)
+
+        # Embedding ağırlıklarını paylaş (aynı tensör, kopya değil)
+        draft.embed.weight = target_model.embed.weight
+        return draft
+
+    # ── Speculative Decoding ──────────────────────────────────────
+
+    @torch.no_grad()
+    def generate_speculative(self, draft_model: 'MiniLiquidGPT',
+                             prompt_ids: torch.Tensor,
+                             max_new: int = 80, gamma: int = 4,
+                             temperature: float = 0.8) -> torch.Tensor:
+        """
+        Speculative Decoding ile metin üret.
+
+        Args:
+            draft_model:  Hızlı taslak model (plastisitesiz, 1 katman)
+            prompt_ids:   [T] veya [1, T] token ID'leri
+            max_new:      Üretilecek maksimum yeni token sayısı
+            gamma:        Draft modelin her turda üreteceği token sayısı
+            temperature:  Örnekleme sıcaklığı (verification greedy'dir)
+
+        Returns:
+            [1, T + generated] tüm token ID'leri
+        """
+        self.eval()
+        draft_model.eval()
+
+        if prompt_ids.dim() == 1:
+            prompt_ids = prompt_ids.unsqueeze(0)
+
+        B = prompt_ids.size(0)
+        device = prompt_ids.device
+
+        # ── Adım A: Prompt Sync ──────────────────────────────────
+        self.init_hidden(B, device)
+        self.reset_hebb()
+        draft_model.init_hidden(B, device)
+        draft_model.reset_hebb()
+
+        ids = prompt_ids.clone()
+
+        # Prompt'u her iki modele de besle
+        for t in range(ids.size(1)):
+            main_logits = self.forward_token(ids[:, t], t,
+                                             enable_plasticity=True)
+            draft_model.forward_token(ids[:, t], t,
+                                      enable_plasticity=False)
+
+        generated_count = 0
+
+        # ── Ana Döngü ─────────────────────────────────────────────
+        while generated_count < max_new:
+            cur_pos = ids.size(1)
+
+            # Kalan token sayısını kontrol et
+            remaining = max_new - generated_count
+            cur_gamma = min(gamma, remaining)
+
+            # ── Adım B: Drafting ──────────────────────────────────
+            draft_tokens = []
+            draft_logits = main_logits  # son logits'ten başla
+            # Draft modeli de son logits'ten başlatmak yerine
+            # draft'ın kendi son logits'ini kullan
+            # İlk draft token: ana modelin son logits'inden greedy al
+            # (draft model de prompt sonundaki state'e sahip)
+
+            # Draft model kendi state'iyle gamma token üretir
+            # İlk draft girdisi: ana modelin son greedy tokeni
+            d_logits = draft_model.forward_token(
+                _greedy_pick(main_logits, temperature).squeeze(-1),
+                cur_pos - 1, enable_plasticity=False
+            )
+            # Aslında draft modelin ilk inputu, ana modelden ilk aday
+            # Ama daha doğru yaklaşım: draft kendi içinden üretsin
+            # Önce draft'ün son prompttaki logits'i kullanılır
+            # Draft zaten prompt sonundaki state'e sahip,
+            # main_logits'ten greedy token alıp onu besliyoruz
+
+            first_draft_tok = _greedy_pick(main_logits, temperature)
+            draft_tokens.append(first_draft_tok)
+
+            # Geriye kalan gamma-1 token draft kendi logits'inden
+            for g in range(1, cur_gamma):
+                d_logits = draft_model.forward_token(
+                    draft_tokens[-1].squeeze(-1),
+                    cur_pos + g - 1,
+                    enable_plasticity=False
+                )
+                draft_tokens.append(_greedy_pick(d_logits, temperature))
+
+            # draft_tokens: [tok0, tok1, ..., tok_{gamma-1}]  her biri [B,1]
+
+            # ── Adım C: Verification ─────────────────────────────
+            saved_state = self.save_state()
+
+            verified_logits_list = []
+            for g in range(cur_gamma):
+                v_logits = self.forward_token(
+                    draft_tokens[g].squeeze(-1),
+                    cur_pos + g,
+                    enable_plasticity=True
+                )
+                verified_logits_list.append(v_logits)
+
+            # ── Adım D: Accept / Reject ──────────────────────────
+            n_accepted = 0
+            for g in range(cur_gamma):
+                # Ana modelin draft token'ın GİRİLMESİNDEN ÖNCEKİ
+                # logits'inden greedy seçim
+                if g == 0:
+                    target_logits = main_logits          # prompt-sonrası logits
+                else:
+                    target_logits = verified_logits_list[g - 1]
+
+                main_choice = _greedy_pick(target_logits, temperature)
+
+                if main_choice.item() == draft_tokens[g].item():
+                    n_accepted += 1
+                else:
+                    break
+
+            # ── Adım E: Rollback veya Commit ─────────────────────
+            # Restore: checkpoint'a geri dön
+            self.restore_state(saved_state)
+
+            # Kabul edilen tokenler için state'i yeniden ilerlet
+            accepted_ids = []
+            for g in range(n_accepted):
+                tok = draft_tokens[g]
+                accepted_ids.append(tok)
+                replay_logits = self.forward_token(
+                    tok.squeeze(-1),
+                    cur_pos + g,
+                    enable_plasticity=True
+                )
+
+            # Ana modelin kendi seçtiği token (reddedilen ilk konum
+            # veya tüm draft kabul edildiyse bonus token)
+            if n_accepted < cur_gamma:
+                # İlk reddedilen konumdaki ana model greedy tokeni
+                if n_accepted == 0:
+                    correction_logits = main_logits
+                else:
+                    correction_logits = replay_logits
+                bonus = _greedy_pick(correction_logits, temperature)
+                accepted_ids.append(bonus)
+                # Bu bonus tokeni de state'e commit et
+                self.forward_token(
+                    bonus.squeeze(-1),
+                    cur_pos + n_accepted,
+                    enable_plasticity=True
+                )
+            else:
+                # Tümü kabul → son verified logits'ten bonus token
+                bonus = _greedy_pick(verified_logits_list[-1], temperature)
+                accepted_ids.append(bonus)
+                self.forward_token(
+                    bonus.squeeze(-1),
+                    cur_pos + n_accepted,
+                    enable_plasticity=True
+                )
+
+            # Kabul edilen tokenları sekansa ekle
+            new_tokens = torch.cat(accepted_ids, dim=-1)  # [B, n+1]
+            if new_tokens.dim() == 1:
+                new_tokens = new_tokens.unsqueeze(0)
+            ids = torch.cat([ids, new_tokens], dim=1)
+            generated_count += new_tokens.size(1)
+
+            # main_logits güncelle: en son forward_token çıktısı
+            main_logits = self.forward_token(
+                ids[:, -1], ids.size(1) - 1,
+                enable_plasticity=True
+            )
+
+            # Draft modeli de senkronize et:
+            # yeni kabul edilen tokenları draft'a besle
+            for tok_idx in range(new_tokens.size(1)):
+                draft_model.forward_token(
+                    new_tokens[:, tok_idx],
+                    cur_pos + tok_idx,
+                    enable_plasticity=False
+                )
+
+        # max_new aşımını kes
+        total_len = prompt_ids.size(1) + max_new
+        ids = ids[:, :total_len]
+        return ids
 
     def hebb_stats(self) -> dict:
         """Tüm Hebb normlarını döndür."""
