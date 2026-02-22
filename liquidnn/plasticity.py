@@ -27,10 +27,11 @@ class PlasticSynapse(nn.Module):
         out_dim: Çıktı boyutu
     """
 
-    def __init__(self, in_dim: int, out_dim: int):
+    def __init__(self, in_dim: int, out_dim: int, sparse_k: int = 0):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
+        self.sparse_k = sparse_k  # 0 = tam yoğun, >0 = top-k sparse
 
         # Sabit ağırlıklar (tüm modellerde var)
         self.W = nn.Parameter(torch.empty(out_dim, in_dim))
@@ -56,7 +57,7 @@ class PlasticSynapse(nn.Module):
     @torch.no_grad()
     def update_hebb(self, pre: torch.Tensor, post: torch.Tensor):
         """
-        Hebbian güncelleme.
+        Hebbian güncelleme (opsiyonel top-k sparsification ile).
 
         pre:  Presinaptik aktivasyon [B, in_dim]
         post: Postsinaptik aktivasyon [B, out_dim]
@@ -76,6 +77,16 @@ class PlasticSynapse(nn.Module):
         max_norm = 0.3 * self.W.data.norm()
         if h_norm > max_norm:
             self.Hebb = self.Hebb * (max_norm / (h_norm + 1e-8))
+
+        # Top-k sparsification
+        if self.sparse_k > 0:
+            flat = self.Hebb.abs().view(-1)
+            total = flat.numel()
+            k = min(self.sparse_k, total)
+            if k < total:
+                threshold = torch.topk(flat, k).values[-1]
+                mask = self.Hebb.abs() >= threshold
+                self.Hebb = self.Hebb * mask
 
     def reset_hebb(self):
         """Plastik izleri sıfırla."""

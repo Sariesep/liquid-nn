@@ -50,7 +50,8 @@ class LiquidODECell(nn.Module):
         return (-h + interaction) / tau
 
     def forward(self, x: torch.Tensor, h: torch.Tensor,
-                enable_plasticity: bool = True) -> torch.Tensor:
+                enable_plasticity: bool = True,
+                adaptive_steps: bool = False) -> torch.Tensor:
         """
         Tek token işle.
 
@@ -58,18 +59,31 @@ class LiquidODECell(nn.Module):
             x: [B, D_in]  girdi
             h: [B, H]     önceki gizli durum
             enable_plasticity: Hebb güncellemesi yapılsın mı
+            adaptive_steps: True → tau değerine göre adım sayısı dinamik seç
 
         Returns:
             [B, H] yeni gizli durum
         """
-        dt = 1.0 / max(self.ode_steps, 1)
+        # Adım sayısını belirle
+        steps = self.ode_steps
+        if adaptive_steps and self.ode_steps > 1:
+            # tau_net ile girdi zorluğunu ölç
+            tau = self.tau_net(torch.cat([x, h], dim=-1)) + self.tau_min
+            mean_tau = tau.mean().item()
+            if mean_tau < 0.5:
+                steps = 1       # Kolay → Euler
+            elif mean_tau < 1.0:
+                steps = 2       # Orta → hafif RK2
+            # else: tam ode_steps
 
-        if self.ode_steps <= 1:
-            # Euler — hızlı katman
+        dt = 1.0 / max(steps, 1)
+
+        if steps <= 1:
+            # Euler — hızlı
             h = h + dt * self._dynamics(h, x)
         else:
             # RK2 Midpoint
-            for _ in range(self.ode_steps):
+            for _ in range(steps):
                 k1 = self._dynamics(h, x)
                 h_mid = h + 0.5 * dt * k1
                 k2 = self._dynamics(h_mid, x)
