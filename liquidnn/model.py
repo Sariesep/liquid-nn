@@ -170,7 +170,9 @@ class MiniLiquidGPT(nn.Module):
                  use_moe: bool = False, moe_top_k: int = 2,
                  use_rmsnorm: bool = False,
                  adaptive_ode: bool = False,
-                 early_exit_threshold: float = 0.0):
+                 early_exit_threshold: float = 0.0,
+                 use_rope: bool = False,
+                 use_flash: bool = True):
         super().__init__()
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
@@ -218,7 +220,8 @@ class MiniLiquidGPT(nn.Module):
         if use_attention:
             self.attn = SlidingWindowAttention(
                 embed_dim, num_heads=attn_heads,
-                window_size=attn_window, dropout=dropout
+                window_size=attn_window, dropout=dropout,
+                use_rope=use_rope, use_flash=use_flash
             )
 
         # MoE Router (isteğe bağlı)
@@ -318,7 +321,7 @@ class MiniLiquidGPT(nn.Module):
 
         # Sliding-Window Attention (etkinse)
         if self.attn is not None:
-            x = self.attn(x)
+            x = self.attn(x, pos=pos)
 
         x = self.out_norm(x)
         logits = F.linear(x, self.embed.weight)  # Weight tying
