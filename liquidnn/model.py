@@ -7,6 +7,11 @@ MiniLiquidGPT — Sıvı Nöral Ağ Dil Modeli
 
 Ağırlık paylaşımı: embed ↔ lm_head
 Pozisyon kodlaması: Sinüzoidal (sabit)
+
+Eklentiler:
+  - Sliding-Window Attention (isteğe bağlı)
+  - Mixture of Experts Router (isteğe bağlı)
+  - Speculative Decoding (adaptive gamma + stochastic acceptance)
 """
 
 import math
@@ -17,6 +22,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .ode_cell import LiquidODECell
+from .attention import SlidingWindowAttention
+from .moe import ExpertRouter
 
 
 def _greedy_pick(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
@@ -35,29 +42,137 @@ def _greedy_pick(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor
     return logits.argmax(dim=-1, keepdim=True)
 
 
+def _speculative_accept(main_logits: torch.Tensor,
+                        draft_logits: torch.Tensor,
+                        draft_token: torch.Tensor,
+                        temperature: float = 0.8):
+    """
+    Speculative Sampling kabul/red kararı (Leviathan et al., 2023).
+
+    p(x) >= q(x) → her zaman kabul
+    p(x) <  q(x) → p(x)/q(x) olasılıkla kabul
+    Reject → max(0, p - q) dağılımından düzeltme tokeni seç
+
+    Args:
+        main_logits:  [B, V] ana modelin logit'leri
+        draft_logits: [B, V] draft modelin logit'leri
+        draft_token:  [B, 1] draft'ın seçtiği token
+        temperature:  Sıcaklık
+
+    Returns:
+        (accepted: bool, correction_token: [B,1] or None)
+    """
+    p = F.softmax(main_logits / temperature, dim=-1)    # ana model dağılımı
+    q = F.softmax(draft_logits / temperature, dim=-1)    # draft dağılımı
+
+    tok_idx = draft_token.squeeze(-1)                     # [B]
+    p_x = p[0, tok_idx[0]]                                # p(draft_token)
+    q_x = q[0, tok_idx[0]]                                # q(draft_token)
+
+    # Kabul olasılığı
+    if q_x.item() == 0:
+        accept_prob = 1.0
+    else:
+        accept_prob = min(1.0, p_x.item() / q_x.item())
+
+    r = torch.rand(1).item()
+    if r < accept_prob:
+        return True, None
+    else:
+        # Reject → düzeltilmiş dağılımdan sample
+        corrected = torch.clamp(p - q, min=0)
+        corrected_sum = corrected.sum()
+        if corrected_sum > 0:
+            corrected = corrected / corrected_sum
+        else:
+            corrected = p  # fallback
+        correction_token = torch.multinomial(corrected, 1)  # [B, 1]
+        return False, correction_token
+
+
+class AdaptiveGammaScheduler:
+    """
+    Kabul oranına göre gamma'yı otomatik ayarlayan scheduler.
+
+    Yüksek kabul oranı → gamma artır (daha agresif drafting)
+    Düşük kabul oranı  → gamma azalt (daha temkinli)
+
+    EMA (Exponential Moving Average) ile yumuşak geçiş sağlar.
+
+    Args:
+        initial:    Başlangıç gamma değeri
+        min_gamma:  Minimum gamma
+        max_gamma:  Maksimum gamma
+        ema_alpha:  EMA düzleştirme katsayısı (0-1, yüksek = hızlı tepki)
+        target_low: Bu oranın altında gamma azalır
+        target_high: Bu oranın üstünde gamma artar
+    """
+
+    def __init__(self, initial: int = 4, min_gamma: int = 1,
+                 max_gamma: int = 8, ema_alpha: float = 0.3,
+                 target_low: float = 0.3, target_high: float = 0.7):
+        self._gamma = float(initial)
+        self.min_gamma = min_gamma
+        self.max_gamma = max_gamma
+        self.ema_alpha = ema_alpha
+        self.target_low = target_low
+        self.target_high = target_high
+        self._acceptance_ema = 0.5  # başlangıç tahmini
+
+    def update(self, n_accepted: int, n_proposed: int):
+        """Kabul oranıyla gamma'yı güncelle."""
+        if n_proposed == 0:
+            return
+        rate = n_accepted / n_proposed
+        self._acceptance_ema = (self.ema_alpha * rate +
+                                (1 - self.ema_alpha) * self._acceptance_ema)
+
+        if self._acceptance_ema > self.target_high:
+            self._gamma = min(self._gamma + 1.0, self.max_gamma)
+        elif self._acceptance_ema < self.target_low:
+            self._gamma = max(self._gamma - 1.0, self.min_gamma)
+
+    @property
+    def gamma(self) -> int:
+        return int(self._gamma)
+
+    @property
+    def acceptance_rate(self) -> float:
+        return self._acceptance_ema
+
 class MiniLiquidGPT(nn.Module):
     """
     Sıvı Nöral Ağ Dil Modeli.
 
     Args:
-        vocab_size: Kelime hazinesi boyutu (tiktoken gpt2 = 50257)
-        embed_dim:  Gömme boyutu
-        num_fast:   Hızlı katman sayısı (steps=1, plast OFF)
-        num_deep:   Derin katman sayısı (steps=3, plast ON)
-        fast_steps: Hızlı katman ODE adım sayısı
-        deep_steps: Derin katman ODE adım sayısı
-        dropout:    Dropout oranı
-        max_seq:    Maksimum sekans uzunluğu (pozisyon kodlaması)
+        vocab_size:     Kelime hazinesi boyutu (tiktoken gpt2 = 50257)
+        embed_dim:      Gömme boyutu
+        num_fast:       Hızlı katman sayısı (steps=1, plast OFF)
+        num_deep:       Derin katman sayısı (steps=3, plast ON)
+        fast_steps:     Hızlı katman ODE adım sayısı
+        deep_steps:     Derin katman ODE adım sayısı
+        dropout:        Dropout oranı
+        max_seq:        Maksimum sekans uzunluğu (pozisyon kodlaması)
+        use_attention:  Sliding-Window Attention aktif mi
+        attn_heads:     Attention başı sayısı
+        attn_window:    Attention pencere boyutu
+        use_moe:        Mixture of Experts Router aktif mi
+        moe_top_k:      MoE: her token için seçilecek expert sayısı
     """
 
     def __init__(self, vocab_size: int = 50257, embed_dim: int = 256,
                  num_fast: int = 2, num_deep: int = 2,
                  fast_steps: int = 1, deep_steps: int = 3,
-                 dropout: float = 0.1, max_seq: int = 512):
+                 dropout: float = 0.1, max_seq: int = 512,
+                 use_attention: bool = False, attn_heads: int = 4,
+                 attn_window: int = 64,
+                 use_moe: bool = False, moe_top_k: int = 2):
         super().__init__()
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.num_layers = num_fast + num_deep
+        self.use_attention = use_attention
+        self.use_moe = use_moe
 
         # Embedding + pozisyon
         self.embed = nn.Embedding(vocab_size, embed_dim)
@@ -87,7 +202,23 @@ class MiniLiquidGPT(nn.Module):
             self.drops.append(nn.Dropout(dropout))
 
         self.out_norm = nn.LayerNorm(embed_dim)
-        # lm_head: weight tying ile embed.weight kullanılır
+
+        # Sliding-Window Attention (isteğe bağlı)
+        self.attn = None
+        if use_attention:
+            self.attn = SlidingWindowAttention(
+                embed_dim, num_heads=attn_heads,
+                window_size=attn_window, dropout=dropout
+            )
+
+        # MoE Router (isteğe bağlı)
+        self.router = None
+        self._aux_loss = torch.tensor(0.0)  # MoE load balance loss
+        if use_moe and self.num_layers > 1:
+            self.router = ExpertRouter(
+                embed_dim, num_experts=self.num_layers,
+                top_k=min(moe_top_k, self.num_layers)
+            )
 
         self._hiddens: Optional[List[torch.Tensor]] = None
 
@@ -102,11 +233,14 @@ class MiniLiquidGPT(nn.Module):
         return pe.unsqueeze(0)  # [1, max_len, D]
 
     def init_hidden(self, batch_size: int, device: torch.device):
-        """Gizli durumları sıfırla."""
+        """Gizli durumları ve attention buffer'ı sıfırla."""
         self._hiddens = [
             torch.zeros(batch_size, self.embed_dim, device=device)
             for _ in range(self.num_layers)
         ]
+        if self.attn is not None:
+            self.attn.reset_buffer()
+        self._aux_loss = torch.tensor(0.0, device=device)
 
     def forward_token(self, token_id: torch.Tensor, pos: int,
                       enable_plasticity: bool = True) -> torch.Tensor:
@@ -132,13 +266,37 @@ class MiniLiquidGPT(nn.Module):
         if pos < self.pos_enc.size(1):
             x = x + self.pos_enc[0, pos]
 
-        for i, (cell, norm, drop) in enumerate(
-                zip(self.cells, self.norms, self.drops)):
-            h_new = cell(x, self._hiddens[i], enable_plasticity)
-            h_new = norm(h_new + x)  # Residual + LayerNorm
-            h_new = drop(h_new)
-            self._hiddens[i] = h_new
-            x = h_new
+        if self.router is not None:
+            # MoE: top-k expert seçimi
+            weights, indices, aux_loss = self.router(x)
+            self._aux_loss = self._aux_loss + aux_loss
+            out = torch.zeros_like(x)
+            for k_idx in range(weights.size(1)):
+                for b in range(B):
+                    eidx = indices[b, k_idx].item()
+                    cell = self.cells[eidx]
+                    norm = self.norms[eidx]
+                    drop = self.drops[eidx]
+                    h_new = cell(x[b:b+1], self._hiddens[eidx][b:b+1],
+                                 enable_plasticity)
+                    h_new = norm(h_new + x[b:b+1])
+                    h_new = drop(h_new)
+                    self._hiddens[eidx][b:b+1] = h_new
+                    out[b:b+1] += weights[b, k_idx] * h_new
+            x = out
+        else:
+            # Standart sıralı katmanlar
+            for i, (cell, norm, drop) in enumerate(
+                    zip(self.cells, self.norms, self.drops)):
+                h_new = cell(x, self._hiddens[i], enable_plasticity)
+                h_new = norm(h_new + x)  # Residual + LayerNorm
+                h_new = drop(h_new)
+                self._hiddens[i] = h_new
+                x = h_new
+
+        # Sliding-Window Attention (etkinse)
+        if self.attn is not None:
+            x = self.attn(x)
 
         x = self.out_norm(x)
         logits = F.linear(x, self.embed.weight)  # Weight tying
@@ -236,6 +394,7 @@ class MiniLiquidGPT(nn.Module):
         Kopyalanan durumlar:
           - self._hiddens  (katman başına gizli durum tensörleri)
           - Her LiquidODECell'in syn_ih.Hebb ve syn_hh.Hebb matrisleri
+          - Attention buffer (etkinse)
 
         Tüm tensörler .detach().clone() ile hesaplama grafiğinden koparılır;
         böylece geri yükleme sırasında VRAM sızıntısı önlenir.
@@ -253,7 +412,12 @@ class MiniLiquidGPT(nn.Module):
                           if cell.syn_hh.Hebb is not None else None)
             saved_hebbs.append(pair)
 
-        return {'hiddens': saved_hiddens, 'hebbs': saved_hebbs}
+        saved_attn = None
+        if self.attn is not None:
+            saved_attn = self.attn.get_buffer_state()
+
+        return {'hiddens': saved_hiddens, 'hebbs': saved_hebbs,
+                'attn': saved_attn}
 
     def restore_state(self, state_dict: dict):
         """
@@ -273,6 +437,9 @@ class MiniLiquidGPT(nn.Module):
                                 if pair['ih'] is not None else None)
             cell.syn_hh.Hebb = (pair['hh'].detach().clone()
                                 if pair['hh'] is not None else None)
+
+        if self.attn is not None and state_dict.get('attn') is not None:
+            self.attn.set_buffer_state(state_dict['attn'])
 
     # ── Draft Model Factory ───────────────────────────────────────
 
@@ -315,19 +482,24 @@ class MiniLiquidGPT(nn.Module):
     def generate_speculative(self, draft_model: 'MiniLiquidGPT',
                              prompt_ids: torch.Tensor,
                              max_new: int = 80, gamma: int = 4,
-                             temperature: float = 0.8) -> torch.Tensor:
+                             temperature: float = 0.8,
+                             adaptive_gamma: bool = False,
+                             use_stochastic: bool = False) -> torch.Tensor:
         """
         Speculative Decoding ile metin üret.
 
         Args:
-            draft_model:  Hızlı taslak model (plastisitesiz, 1 katman)
-            prompt_ids:   [T] veya [1, T] token ID'leri
-            max_new:      Üretilecek maksimum yeni token sayısı
-            gamma:        Draft modelin her turda üreteceği token sayısı
-            temperature:  Örnekleme sıcaklığı (verification greedy'dir)
+            draft_model:     Hızlı taslak model (plastisitesiz, 1 katman)
+            prompt_ids:      [T] veya [1, T] token ID'leri
+            max_new:         Üretilecek maksimum yeni token sayısı
+            gamma:           Draft modelin her turda üreteceği token sayısı
+            temperature:     Örnekleme sıcaklığı
+            adaptive_gamma:  True ise gamma kabul oranına göre otomatik ayarlanır
+            use_stochastic:  True ise greedy yerine olasılıksal kabul kullanılır
+                             (Leviathan et al., 2023)
 
         Returns:
-            [1, T + generated] tüm token ID'leri
+            [1, T + max_new] tüm token ID'leri
         """
         self.eval()
         draft_model.eval()
@@ -337,6 +509,11 @@ class MiniLiquidGPT(nn.Module):
 
         B = prompt_ids.size(0)
         device = prompt_ids.device
+
+        # Adaptive gamma scheduler
+        scheduler = None
+        if adaptive_gamma:
+            scheduler = AdaptiveGammaScheduler(initial=gamma)
 
         # ── Adım A: Prompt Sync ──────────────────────────────────
         self.init_hidden(B, device)
@@ -359,43 +536,35 @@ class MiniLiquidGPT(nn.Module):
         while generated_count < max_new:
             cur_pos = ids.size(1)
 
-            # Kalan token sayısını kontrol et
+            # Gamma belirle
+            cur_gamma_val = scheduler.gamma if scheduler else gamma
             remaining = max_new - generated_count
-            cur_gamma = min(gamma, remaining)
+            cur_gamma = min(cur_gamma_val, remaining)
 
             # ── Adım B: Drafting ──────────────────────────────────
             draft_tokens = []
-            draft_logits = main_logits  # son logits'ten başla
-            # Draft modeli de son logits'ten başlatmak yerine
-            # draft'ın kendi son logits'ini kullan
-            # İlk draft token: ana modelin son logits'inden greedy al
-            # (draft model de prompt sonundaki state'e sahip)
+            draft_logits_list = []   # stochastic kabul için gerekli
 
-            # Draft model kendi state'iyle gamma token üretir
-            # İlk draft girdisi: ana modelin son greedy tokeni
-            d_logits = draft_model.forward_token(
-                _greedy_pick(main_logits, temperature).squeeze(-1),
-                cur_pos - 1, enable_plasticity=False
-            )
-            # Aslında draft modelin ilk inputu, ana modelden ilk aday
-            # Ama daha doğru yaklaşım: draft kendi içinden üretsin
-            # Önce draft'ün son prompttaki logits'i kullanılır
-            # Draft zaten prompt sonundaki state'e sahip,
-            # main_logits'ten greedy token alıp onu besliyoruz
-
+            # İlk draft token: main_logits'ten greedy
             first_draft_tok = _greedy_pick(main_logits, temperature)
             draft_tokens.append(first_draft_tok)
+            draft_logits_list.append(main_logits.clone())  # ilk token için
 
-            # Geriye kalan gamma-1 token draft kendi logits'inden
+            # Draft modelin state'ini ilerlet + geri kalan tokenler
+            d_logits = draft_model.forward_token(
+                first_draft_tok.squeeze(-1),
+                cur_pos - 1, enable_plasticity=False
+            )
+
             for g in range(1, cur_gamma):
+                draft_logits_list.append(d_logits.clone())
+                next_tok = _greedy_pick(d_logits, temperature)
+                draft_tokens.append(next_tok)
                 d_logits = draft_model.forward_token(
-                    draft_tokens[-1].squeeze(-1),
+                    next_tok.squeeze(-1),
                     cur_pos + g - 1,
                     enable_plasticity=False
                 )
-                draft_tokens.append(_greedy_pick(d_logits, temperature))
-
-            # draft_tokens: [tok0, tok1, ..., tok_{gamma-1}]  her biri [B,1]
 
             # ── Adım C: Verification ─────────────────────────────
             saved_state = self.save_state()
@@ -411,27 +580,44 @@ class MiniLiquidGPT(nn.Module):
 
             # ── Adım D: Accept / Reject ──────────────────────────
             n_accepted = 0
+            stochastic_correction = None
+
             for g in range(cur_gamma):
-                # Ana modelin draft token'ın GİRİLMESİNDEN ÖNCEKİ
-                # logits'inden greedy seçim
+                # Ana modelin bu pozisyondaki logits'i
                 if g == 0:
-                    target_logits = main_logits          # prompt-sonrası logits
+                    target_logits = main_logits
                 else:
                     target_logits = verified_logits_list[g - 1]
 
-                main_choice = _greedy_pick(target_logits, temperature)
-
-                if main_choice.item() == draft_tokens[g].item():
-                    n_accepted += 1
+                if use_stochastic:
+                    # Olasılıksal kabul
+                    accepted, correction = _speculative_accept(
+                        target_logits, draft_logits_list[g],
+                        draft_tokens[g], temperature
+                    )
+                    if accepted:
+                        n_accepted += 1
+                    else:
+                        stochastic_correction = correction
+                        break
                 else:
-                    break
+                    # Greedy kabul
+                    main_choice = _greedy_pick(target_logits, temperature)
+                    if main_choice.item() == draft_tokens[g].item():
+                        n_accepted += 1
+                    else:
+                        break
+
+            # Adaptive gamma güncelle
+            if scheduler:
+                scheduler.update(n_accepted, cur_gamma)
 
             # ── Adım E: Rollback veya Commit ─────────────────────
-            # Restore: checkpoint'a geri dön
             self.restore_state(saved_state)
 
             # Kabul edilen tokenler için state'i yeniden ilerlet
             accepted_ids = []
+            replay_logits = None
             for g in range(n_accepted):
                 tok = draft_tokens[g]
                 accepted_ids.append(tok)
@@ -441,47 +627,49 @@ class MiniLiquidGPT(nn.Module):
                     enable_plasticity=True
                 )
 
-            # Ana modelin kendi seçtiği token (reddedilen ilk konum
-            # veya tüm draft kabul edildiyse bonus token)
+            # Bonus / düzeltme tokeni
             if n_accepted < cur_gamma:
-                # İlk reddedilen konumdaki ana model greedy tokeni
-                if n_accepted == 0:
-                    correction_logits = main_logits
+                if use_stochastic and stochastic_correction is not None:
+                    # Stochastic: düzeltilmiş dağılımdan seçilmiş token
+                    bonus = stochastic_correction
                 else:
-                    correction_logits = replay_logits
-                bonus = _greedy_pick(correction_logits, temperature)
-                accepted_ids.append(bonus)
-                # Bu bonus tokeni de state'e commit et
-                self.forward_token(
-                    bonus.squeeze(-1),
-                    cur_pos + n_accepted,
-                    enable_plasticity=True
-                )
+                    # Greedy: ana modelin kendi seçimi
+                    if n_accepted == 0:
+                        correction_logits = main_logits
+                    else:
+                        correction_logits = replay_logits
+                    bonus = _greedy_pick(correction_logits, temperature)
             else:
                 # Tümü kabul → son verified logits'ten bonus token
-                bonus = _greedy_pick(verified_logits_list[-1], temperature)
-                accepted_ids.append(bonus)
-                self.forward_token(
-                    bonus.squeeze(-1),
-                    cur_pos + n_accepted,
-                    enable_plasticity=True
-                )
+                if use_stochastic:
+                    p = F.softmax(verified_logits_list[-1] / temperature,
+                                  dim=-1)
+                    bonus = torch.multinomial(p, 1)
+                else:
+                    bonus = _greedy_pick(verified_logits_list[-1], temperature)
+
+            accepted_ids.append(bonus)
+            # Bonus tokeni state'e commit et
+            self.forward_token(
+                bonus.squeeze(-1),
+                cur_pos + n_accepted,
+                enable_plasticity=True
+            )
 
             # Kabul edilen tokenları sekansa ekle
-            new_tokens = torch.cat(accepted_ids, dim=-1)  # [B, n+1]
+            new_tokens = torch.cat(accepted_ids, dim=-1)
             if new_tokens.dim() == 1:
                 new_tokens = new_tokens.unsqueeze(0)
             ids = torch.cat([ids, new_tokens], dim=1)
             generated_count += new_tokens.size(1)
 
-            # main_logits güncelle: en son forward_token çıktısı
+            # main_logits güncelle
             main_logits = self.forward_token(
                 ids[:, -1], ids.size(1) - 1,
                 enable_plasticity=True
             )
 
-            # Draft modeli de senkronize et:
-            # yeni kabul edilen tokenları draft'a besle
+            # Draft modeli senkronize et
             for tok_idx in range(new_tokens.size(1)):
                 draft_model.forward_token(
                     new_tokens[:, tok_idx],
