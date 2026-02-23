@@ -74,6 +74,12 @@ print(f"📝 Corpus: {len(CORPUS)} karakter → {len(tokens)} token")
 # ║  CELL 4: Model Oluştur (v0.3.4 tüm özellikler açık)        ║
 # ╚═══════════════════════════════════════════════════════════════╝
 
+# NOT: use_attention=False — Attention modülünün KV cache'i
+# eğitim sırasında autograd in-place hatası verebilir.
+# Inference'ta (generate) attention güvenle kullanılabilir.
+# v0.3.4'ün asıl yenilikleri (neuromod, homeostasis, dual hebb,
+# consolidation) ODE + plastisite katmanlarındadır.
+
 model = MiniLiquidGPT(
     vocab_size=tokenizer.vocab_size,
     embed_dim=128,
@@ -83,12 +89,8 @@ model = MiniLiquidGPT(
     deep_steps=3,
     dropout=0.1,
     max_seq=512,
-    # ── Attention ──
-    use_attention=True,
-    attn_heads=4,
-    attn_window=64,
-    use_rope=True,
-    use_flash=True,
+    # ── Attention (eğitimde KAPALI — KV cache autograd sorunu) ──
+    use_attention=False,
     # ── MoE ──
     use_moe=False,          # küçük modelde MoE gereksiz
     # ── v0.3.4 ──
