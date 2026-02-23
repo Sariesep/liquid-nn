@@ -58,7 +58,8 @@ class PlasticSynapse(nn.Module):
         self.alpha = nn.Parameter(0.01 * torch.randn(out_dim, in_dim))
         self.log_eta = nn.Parameter(torch.tensor(-3.0))
         self.logit_decay = nn.Parameter(torch.tensor(3.0))
-        self.hebb_capacity = nn.Parameter(torch.tensor(1.0))
+        self.hebb_capacity = nn.Parameter(torch.tensor(2.0))
+        self.register_buffer('_hebb_steps', torch.tensor(0))
 
         # Plastik iz (fast)
         self.register_buffer('Hebb', None)
@@ -131,9 +132,11 @@ class PlasticSynapse(nn.Module):
 
         self.Hebb = decay * self.Hebb + eta * outer
 
-        # Öğrenilebilir norm sınırı (fast)
+        # Adaptif norm sınırı: zaman içinde büyüyen kapasite
+        self._hebb_steps += 1
+        growth = 1.0 + 0.1 * torch.log1p(self._hebb_steps.float()).item()
         h_norm = self.Hebb.norm()
-        max_norm = F.softplus(self.hebb_capacity)
+        max_norm = F.softplus(self.hebb_capacity) * growth
         if h_norm > max_norm:
             self.Hebb = self.Hebb * (max_norm / (h_norm + 1e-8))
 

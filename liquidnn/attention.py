@@ -1,11 +1,10 @@
 """
-Sliding-Window Attention v2 — RoPE + KV Cache + Flash Attention
+Sliding-Window Attention v3 — Training + Inference Dual Mode
 
-v0.3.1 iyileştirmeleri:
-  - RoPE (Rotary Position Encoding): göreceli pozisyon bilgisi
-  - KV Cache: önceki tokenler için K/V yeniden hesaplanmaz
-  - Flash Attention: F.scaled_dot_product_attention ile 2-4x hızlanma
-  - GQA (Grouped Query Attention): devam ediyor
+v0.3.5 iyileştirmeleri:
+  - Training Mode: Full-sequence causal attention (cache yok, autograd güvenli)
+  - Inference Mode: KV Cache + detached yaklaşım (tek token)
+  - RoPE, GQA, Flash Attention devam ediyor
 """
 
 import math
@@ -31,25 +30,19 @@ def _apply_rope(x: torch.Tensor, pos: int,
     RoPE uygula.
 
     Args:
-        x:     [B, H, 1, Dh] veya [B, H, S, Dh]
-        pos:   başlangıç pozisyonu (tek token → pos, KV cache → offset)
+        x:     [B, H, S, Dh]
+        pos:   başlangıç pozisyonu
         freqs: [max_len, Dh//2, 2] precomputed cos/sin
-
-    Returns:
-        aynı şekilde rotated x
     """
     B, H, S, Dh = x.shape
-    # x'i çiftler halinde böl
-    x_pair = x.view(B, H, S, Dh // 2, 2)  # [..., (x0, x1)]
+    x_pair = x.view(B, H, S, Dh // 2, 2)
 
-    # İlgili pozisyonların frekanslarını al
     positions = torch.arange(pos, pos + S, device=x.device)
-    f = freqs[positions].to(x.device, x.dtype)  # [S, Dh//2, 2]
-    cos_f = f[..., 0].unsqueeze(0).unsqueeze(0)  # [1, 1, S, Dh//2]
+    f = freqs[positions].to(x.device, x.dtype)
+    cos_f = f[..., 0].unsqueeze(0).unsqueeze(0)
     sin_f = f[..., 1].unsqueeze(0).unsqueeze(0)
 
-    # Rotary: (x0 * cos - x1 * sin, x0 * sin + x1 * cos)
-    x0 = x_pair[..., 0]  # [B, H, S, Dh//2]
+    x0 = x_pair[..., 0]
     x1 = x_pair[..., 1]
     out0 = x0 * cos_f - x1 * sin_f
     out1 = x0 * sin_f + x1 * cos_f
@@ -59,7 +52,7 @@ def _apply_rope(x: torch.Tensor, pos: int,
 
 class SlidingWindowAttention(nn.Module):
     """
-    v2: RoPE + KV Cache + Flash Attention + GQA.
+    v3: Dual-mode — Training (full-seq) + Inference (KV cache).
 
     Args:
         embed_dim:    Gömme boyutu
@@ -109,15 +102,13 @@ class SlidingWindowAttention(nn.Module):
             rope_freqs = _precompute_freqs(self.head_dim, max_len=4096)
             self.register_buffer('_rope_freqs', rope_freqs)
 
-        # KV Cache (ring buffer): head boyutunda cache'le
-        # [B, Hkv, window_size, Dh] — pre-projected
+        # KV Cache (inference only)
         self.register_buffer('_k_cache',
                              torch.zeros(1, self.num_kv_heads,
                                          window_size, self.head_dim))
         self.register_buffer('_v_cache',
                              torch.zeros(1, self.num_kv_heads,
                                          window_size, self.head_dim))
-        # Eski raw buffer (save/restore uyumu için)
         self.register_buffer('_buffer',
                              torch.zeros(1, window_size, embed_dim))
         self._buf_len = 0
@@ -143,23 +134,103 @@ class SlidingWindowAttention(nn.Module):
         self._v_cache = state['v_cache'].detach().clone()
         self._buf_len = state['buf_len']
 
-    def forward(self, x: torch.Tensor, pos: int = 0) -> torch.Tensor:
+    # ═══ Training Mode: Full-Sequence Causal Attention ═══════════
+
+    def forward_train(self, x_seq: torch.Tensor,
+                      start_pos: int = 0) -> torch.Tensor:
         """
-        Tek token'a attention uygula (RoPE + KV Cache + Flash).
+        Eğitim modu: tam sekans üzerinde causal self-attention.
+        KV cache KULLANMAZ — tamamen autograd-safe.
 
         Args:
-            x:   [B, D] mevcut token gömmesi
-            pos: sekans pozisyonu (RoPE için gerekli)
+            x_seq:     [B, T, D] token gömme sekansı
+            start_pos: RoPE için başlangıç pozisyonu
 
         Returns:
-            [B, D] attention ile zenginleştirilmiş çıktı
+            [B, T, D] attention çıktısı
         """
+        B, T, D = x_seq.shape
+        H = self.num_heads
+        Hkv = self.num_kv_heads
+        Dh = self.head_dim
+
+        # Q, K, V projeksiyonları — tüm sekans birden
+        q = self.W_q(x_seq).view(B, T, H, Dh).transpose(1, 2)      # [B, H, T, Dh]
+        k = self.W_k(x_seq).view(B, T, Hkv, Dh).transpose(1, 2)    # [B, Hkv, T, Dh]
+        v = self.W_v(x_seq).view(B, T, Hkv, Dh).transpose(1, 2)
+
+        # RoPE
+        if self.use_rope:
+            q = _apply_rope(q, start_pos, self._rope_freqs)
+            k = _apply_rope(k, start_pos, self._rope_freqs)
+
+        # GQA genişletme
+        if self.groups > 1:
+            k = k.repeat_interleave(self.groups, dim=1)
+            v = v.repeat_interleave(self.groups, dim=1)
+
+        # Causal attention (sliding window)
+        if self.use_flash and hasattr(F, 'scaled_dot_product_attention'):
+            drop_p = self.attn_drop_p if self.training else 0.0
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=drop_p,
+                is_causal=True
+            )  # [B, H, T, Dh]
+        else:
+            scale = Dh ** -0.5
+            attn = torch.matmul(q, k.transpose(-2, -1)) * scale
+
+            # Causal mask
+            causal_mask = torch.triu(
+                torch.ones(T, T, device=x_seq.device, dtype=torch.bool),
+                diagonal=1
+            )
+            attn = attn.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0),
+                                     float('-inf'))
+            attn = F.softmax(attn, dim=-1)
+            attn = self.attn_drop(attn)
+            out = torch.matmul(attn, v)
+
+        out = out.transpose(1, 2).contiguous().view(B, T, D)   # [B, T, D]
+        out = self.W_o(out)
+
+        # Gated residual (sekans boyunca)
+        gate_input = torch.cat([x_seq, out], dim=-1)   # [B, T, 2D]
+        g = self.gate(gate_input)
+        return x_seq + g * out
+
+    # ═══ Inference Mode: Single-Token + KV Cache ═════════════════
+
+    def forward(self, x: torch.Tensor, pos: int = 0) -> torch.Tensor:
+        """
+        Çift modlu forward:
+        - training=True  → forward_train (x: [B, T, D] veya [B, D])
+        - training=False → single-token KV cache (x: [B, D])
+        """
+        # Eğitim modunda ve 3D girdi → full-sequence
+        if self.training and x.dim() == 3:
+            return self.forward_train(x, start_pos=pos)
+
+        # Aşağıdaki kısım sadece inference (single-token) için
+        if x.dim() == 3:
+            # Inference'da 3D girdi → her token için tek tek çağır
+            B, T, D = x.shape
+            outputs = []
+            for t in range(T):
+                out_t = self._forward_single(x[:, t], pos=pos + t)
+                outputs.append(out_t)
+            return torch.stack(outputs, dim=1)  # [B, T, D]
+
+        return self._forward_single(x, pos=pos)
+
+    def _forward_single(self, x: torch.Tensor, pos: int = 0) -> torch.Tensor:
+        """Tek token inference — KV cache ile."""
         B, D = x.shape
         H = self.num_heads
         Hkv = self.num_kv_heads
         Dh = self.head_dim
 
-        # Batch boyutu değiştiyse cache'leri yeniden oluştur
         if self._k_cache.size(0) != B:
             self._k_cache = torch.zeros(
                 B, Hkv, self.window_size, Dh,
@@ -172,18 +243,16 @@ class SlidingWindowAttention(nn.Module):
                 device=x.device, dtype=x.dtype)
             self._buf_len = 0
 
-        # ── Yeni token'ın Q, K, V projeksiyonları ────────────────
-        q = self.W_q(x).view(B, 1, H, Dh).transpose(1, 2)    # [B, H, 1, Dh]
-        k_new = self.W_k(x).view(B, 1, Hkv, Dh).transpose(1, 2)  # [B, Hkv, 1, Dh]
+        q = self.W_q(x).view(B, 1, H, Dh).transpose(1, 2)
+        k_new = self.W_k(x).view(B, 1, Hkv, Dh).transpose(1, 2)
         v_new = self.W_v(x).view(B, 1, Hkv, Dh).transpose(1, 2)
 
-        # ── RoPE ────────────────────────────────────────────────
         if self.use_rope:
             q = _apply_rope(q, pos, self._rope_freqs)
             k_new = _apply_rope(k_new, pos, self._rope_freqs)
 
-        # ── KV Cache güncelle (detached — gradient cache'e akmaz) ──
-        k_new_det = k_new.detach().squeeze(2)  # [B, Hkv, Dh]
+        # KV Cache güncelle (detached)
+        k_new_det = k_new.detach().squeeze(2)
         v_new_det = v_new.detach().squeeze(2)
         x_det = x.detach()
 
@@ -200,33 +269,28 @@ class SlidingWindowAttention(nn.Module):
             self._v_cache[:, :, -1] = v_new_det
             self._buffer[:, -1] = x_det
 
-        # ── Attention K/V oluştur (mevcut token gradient-tracked) ─
         seq_len = self._buf_len
         if seq_len > 1:
-            k_past = self._k_cache[:, :, :seq_len - 1]  # detached
+            k_past = self._k_cache[:, :, :seq_len - 1]
             v_past = self._v_cache[:, :, :seq_len - 1]
-            k = torch.cat([k_past, k_new], dim=2)   # [B, Hkv, S, Dh]
+            k = torch.cat([k_past, k_new], dim=2)
             v = torch.cat([v_past, v_new], dim=2)
         else:
-            k = k_new   # [B, Hkv, 1, Dh]
+            k = k_new
             v = v_new
 
-        # GQA: KV head'lerini Q sayısına genişlet
         if self.groups > 1:
             k = k.repeat_interleave(self.groups, dim=1)
             v = v.repeat_interleave(self.groups, dim=1)
 
-        # ── Attention hesapla ───────────────────────────────────
         if self.use_flash and hasattr(F, 'scaled_dot_product_attention'):
-            # Flash Attention (PyTorch 2.0+)
             drop_p = self.attn_drop_p if self.training else 0.0
             out = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p=drop_p,
-                is_causal=False  # window zaten causal mantık sağlıyor
-            )  # [B, H, 1, Dh]
+                is_causal=False
+            )
         else:
-            # Fallback: manual attention
             scale = Dh ** -0.5
             attn = torch.matmul(q, k.transpose(-2, -1)) * scale
             attn = F.softmax(attn, dim=-1)
@@ -236,7 +300,6 @@ class SlidingWindowAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, D)
         out = self.W_o(out)
 
-        # Gated residual
         gate_input = torch.cat([x, out], dim=-1)
         g = self.gate(gate_input)
         return x + g * out

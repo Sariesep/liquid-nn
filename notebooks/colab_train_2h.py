@@ -1,5 +1,5 @@
 """
-LiquidNN v0.3.4 — 2 Saatlik Tam Eğitim (Google Colab)
+LiquidNN v0.3.5 — 2 Saatlik Tam Eğitim (Google Colab)
 =======================================================
 GPU runtime seçin: Runtime → Change runtime type → T4 GPU
 Eğitim ~2 saat sürer, checkpoint'lar Google Drive'a kaydedilir.
@@ -88,15 +88,22 @@ print(f"   Train: {len(train_data):,} token, Val: {len(val_data):,} token")
 
 model = MiniLiquidGPT(
     vocab_size=tokenizer.vocab_size,
-    embed_dim=256,           # demo'dan 2x büyük
+    embed_dim=256,
     num_fast=2,
     num_deep=2,
     fast_steps=1,
     deep_steps=3,
     dropout=0.1,
     max_seq=512,
-    # ── Attention (eğitimde kapalı — KV cache autograd sorunu) ──
-    use_attention=False,
+    # ── Attention (şimdi eğitimde çalışıyor!) ──
+    use_attention=True,
+    attn_heads=4,
+    attn_window=64,
+    use_rope=True,
+    use_flash=True,
+    # ── FFN (v0.3.5 yeni!) ──
+    use_ffn=True,
+    ffn_mult=4.0,
     # ── v0.3.4 Özellikleri ──
     use_neuromod=True,
     use_homeostasis=True,
@@ -110,10 +117,10 @@ model = MiniLiquidGPT(
 ).to(device)
 
 total_params = sum(p.numel() for p in model.parameters())
-print(f"\n🧠 Model: MiniLiquidGPT v0.3.4")
+print(f"\n🧠 Model: MiniLiquidGPT v0.3.5")
 print(f"   Parametreler: {total_params:,} ({total_params/1e6:.2f}M)")
 print(f"   Katmanlar: {model.num_layers} (2 fast + 2 deep)")
-print(f"   embed_dim: 256")
+print(f"   Özellikler: Attention ✅  FFN ✅  Neuromod ✅  DualHebb ✅")
 
 # ╔═══════════════════════════════════════════════════════════════╗
 # ║  CELL 5: Eğitim Ayarları                                    ║
@@ -129,6 +136,7 @@ MAX_HOURS = 2.0               # Maksimum eğitim süresi
 CHECKPOINT_EVERY = 500        # Her N adımda checkpoint kaydet
 VAL_EVERY = 250               # Her N adımda validasyon yap
 LOG_EVERY = 50                # Her N adımda log bas
+GRAD_ACCUM_STEPS = 4          # Gradient accumulation (effective batch = 32)
 
 # Toplam adım tahmini
 tokens_per_step = BATCH_SIZE * SEQ_LEN
@@ -206,6 +214,16 @@ train_losses = []
 val_losses = []
 step = 0
 
+# Mixed Precision (AMP)
+use_amp = device.type == 'cuda'
+scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+if use_amp:
+    print("  ⚡ Mixed Precision (AMP) aktif")
+print(f"  📦 Gradient Accumulation: {GRAD_ACCUM_STEPS}x "
+      f"(effective batch = {BATCH_SIZE * GRAD_ACCUM_STEPS})")
+
+optimizer.zero_grad()
+
 try:
     while True:
         step += 1
@@ -219,21 +237,30 @@ try:
             print(f"\n📊 Maksimum adım ({MAX_STEPS}) ulaşıldı.")
             break
 
-        # Forward + Backward
-        x_batch, y_batch = make_batch(train_data, SEQ_LEN, BATCH_SIZE)
-        logits = model(x_batch, enable_plasticity=True, chunk_size=CHUNK_SIZE)
-        loss = F.cross_entropy(
-            logits.reshape(-1, logits.size(-1)),
-            y_batch.reshape(-1)
-        )
+        # Forward + Backward (Gradient Accumulation)
+        accum_loss = 0.0
+        for accum_step in range(GRAD_ACCUM_STEPS):
+            x_batch, y_batch = make_batch(train_data, SEQ_LEN, BATCH_SIZE)
 
-        optimizer.zero_grad()
-        loss.backward()
+            with torch.cuda.amp.autocast(enabled=use_amp):
+                logits = model(x_batch, enable_plasticity=True,
+                               chunk_size=CHUNK_SIZE)
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    y_batch.reshape(-1)
+                ) / GRAD_ACCUM_STEPS
+
+            scaler.scale(loss).backward()
+            accum_loss += loss.item() * GRAD_ACCUM_STEPS
+
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad()
         scheduler.step()
 
-        train_losses.append(loss.item())
+        train_losses.append(accum_loss / GRAD_ACCUM_STEPS)
 
         # ── Log ───────────────────────────────────────────────
         if step % LOG_EVERY == 0:
@@ -357,6 +384,8 @@ model = MiniLiquidGPT(
     vocab_size=50257, embed_dim=256,
     num_fast=2, num_deep=2,
     fast_steps=1, deep_steps=3,
+    use_attention=True, attn_heads=4,
+    use_ffn=True, ffn_mult=4.0,
     use_neuromod=True, use_homeostasis=True,
     use_dual_hebb=True, use_consolidation=True,
     use_rmsnorm=True, tau_gate=True,

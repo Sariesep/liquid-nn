@@ -19,6 +19,12 @@ v0.3.4 eklentileri:
   - Çift Hızlı Hebb (Multi-Timescale)
   - MoE Expert Capacity Limiting
   - Sinaptik Konsolidasyon
+
+v0.3.5 eklentileri:
+  - Eğitim Modunda Attention (full-sequence causal)
+  - SwiGLU FFN Katmanları
+  - Adaptif Hebb Kapasitesi
+  - Mixed Precision / Gradient Accumulation desteği
 """
 
 import math
@@ -33,6 +39,7 @@ from .attention import SlidingWindowAttention
 from .moe import ExpertRouter
 from .rmsnorm import RMSNorm
 from .neuromodulation import Neuromodulator
+from .ffn import SwiGLUFFN
 
 
 def _greedy_pick(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
@@ -190,7 +197,9 @@ class MiniLiquidGPT(nn.Module):
                  use_dual_hebb: bool = False,
                  use_consolidation: bool = False,
                  consolidation_strength: float = 1.0,
-                 moe_capacity_factor: float = 0.0):
+                 moe_capacity_factor: float = 0.0,
+                 use_ffn: bool = False,
+                 ffn_mult: float = 4.0):
         super().__init__()
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
@@ -203,6 +212,7 @@ class MiniLiquidGPT(nn.Module):
         self.use_multiscale = use_multiscale
         self.tau_gate = tau_gate
         self.use_neuromod = use_neuromod
+        self.use_ffn = use_ffn
 
         # Norm sınıfı seçimi
         NormClass = RMSNorm if use_rmsnorm else nn.LayerNorm
@@ -246,6 +256,15 @@ class MiniLiquidGPT(nn.Module):
             self.drops.append(nn.Dropout(dropout))
 
         self.out_norm = NormClass(embed_dim)
+
+        # FFN katmanları (isteğe bağlı)
+        self.ffns = nn.ModuleList()
+        self.ffn_norms = nn.ModuleList()
+        if use_ffn:
+            for _ in range(self.num_layers):
+                self.ffns.append(SwiGLUFFN(embed_dim, mult=ffn_mult,
+                                           dropout=dropout))
+                self.ffn_norms.append(NormClass(embed_dim))
 
         # Sliding-Window Attention (isteğe bağlı)
         self.attn = None
@@ -412,6 +431,11 @@ class MiniLiquidGPT(nn.Module):
                     h_new = norm(h_new + x)
                     h_new = drop(h_new)
                     self._hiddens[i] = h_new
+
+                    # FFN (varsa)
+                    if self.use_ffn and i < len(self.ffns):
+                        h_new = h_new + self.ffns[i](self.ffn_norms[i](h_new))
+
                     x = h_new
 
                     # Early Exit
@@ -424,8 +448,13 @@ class MiniLiquidGPT(nn.Module):
                         if confidence.item() > self.early_exit_threshold:
                             break
 
-        # Sliding-Window Attention (etkinse)
-        if self.attn is not None:
+        # Embedding'i kaydet (training attention için)
+        self._last_embed = x
+
+        # Sliding-Window Attention
+        # Eğitimde: forward() sonunda full-sequence olarak uygulanacak
+        # Inference'da: tek token KV cache ile
+        if self.attn is not None and not self.training:
             x = self.attn(x, pos=pos)
 
         x = self.out_norm(x)
@@ -466,6 +495,7 @@ class MiniLiquidGPT(nn.Module):
         detach_freq = max(1, chunk_size // 2) if use_checkpointing else chunk_size
 
         all_logits = []
+        all_embeds = []
         for t in range(T):
             # Truncated BPTT (agresif mod: her detach_freq adımda)
             if t > 0 and t % detach_freq == 0:
@@ -475,8 +505,18 @@ class MiniLiquidGPT(nn.Module):
 
             logits = self.forward_token(input_ids[:, t], t, enable_plasticity)
             all_logits.append(logits)
+            all_embeds.append(self._last_embed)
 
-        return torch.stack(all_logits, dim=1)
+        # Eğitim modunda attention: tüm sekans üzerinde full-sequence causal
+        logits_stack = torch.stack(all_logits, dim=1)  # [B, T, V]
+
+        if self.attn is not None and self.training:
+            embed_seq = torch.stack(all_embeds, dim=1)  # [B, T, D]
+            embed_seq = self.attn(embed_seq, pos=0)     # full-seq causal
+            logits_stack = F.linear(self.out_norm(embed_seq),
+                                    self.embed.weight)
+
+        return logits_stack
 
     @torch.no_grad()
     def generate(self, prompt_ids: torch.Tensor, max_new: int = 80,
