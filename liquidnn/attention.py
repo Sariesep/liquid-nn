@@ -182,33 +182,34 @@ class SlidingWindowAttention(nn.Module):
             q = _apply_rope(q, pos, self._rope_freqs)
             k_new = _apply_rope(k_new, pos, self._rope_freqs)
 
-        # ── KV Cache güncelle (FIFO, autograd-safe) ─────────────
+        # ── KV Cache güncelle (detached — gradient cache'e akmaz) ──
+        k_new_det = k_new.detach().squeeze(2)  # [B, Hkv, Dh]
+        v_new_det = v_new.detach().squeeze(2)
+        x_det = x.detach()
+
         if self._buf_len < self.window_size:
-            k_cache = self._k_cache.clone()
-            v_cache = self._v_cache.clone()
-            buf = self._buffer.clone()
-            k_cache[:, :, self._buf_len] = k_new.squeeze(2)
-            v_cache[:, :, self._buf_len] = v_new.squeeze(2)
-            buf[:, self._buf_len] = x
-            self._k_cache = k_cache
-            self._v_cache = v_cache
-            self._buffer = buf
+            self._k_cache[:, :, self._buf_len] = k_new_det
+            self._v_cache[:, :, self._buf_len] = v_new_det
+            self._buffer[:, self._buf_len] = x_det
             self._buf_len += 1
         else:
-            k_cache = torch.roll(self._k_cache, -1, dims=2).clone()
-            v_cache = torch.roll(self._v_cache, -1, dims=2).clone()
-            buf = torch.roll(self._buffer, -1, dims=1).clone()
-            k_cache[:, :, -1] = k_new.squeeze(2)
-            v_cache[:, :, -1] = v_new.squeeze(2)
-            buf[:, -1] = x
-            self._k_cache = k_cache
-            self._v_cache = v_cache
-            self._buffer = buf
+            self._k_cache = torch.roll(self._k_cache, -1, dims=2)
+            self._v_cache = torch.roll(self._v_cache, -1, dims=2)
+            self._buffer = torch.roll(self._buffer, -1, dims=1)
+            self._k_cache[:, :, -1] = k_new_det
+            self._v_cache[:, :, -1] = v_new_det
+            self._buffer[:, -1] = x_det
 
-        # ── Cache'ten K/V al (clone ile autograd-safe) ───────────
+        # ── Attention K/V oluştur (mevcut token gradient-tracked) ─
         seq_len = self._buf_len
-        k = self._k_cache[:, :, :seq_len].clone()  # [B, Hkv, S, Dh]
-        v = self._v_cache[:, :, :seq_len].clone()
+        if seq_len > 1:
+            k_past = self._k_cache[:, :, :seq_len - 1]  # detached
+            v_past = self._v_cache[:, :, :seq_len - 1]
+            k = torch.cat([k_past, k_new], dim=2)   # [B, Hkv, S, Dh]
+            v = torch.cat([v_past, v_new], dim=2)
+        else:
+            k = k_new   # [B, Hkv, 1, Dh]
+            v = v_new
 
         # GQA: KV head'lerini Q sayısına genişlet
         if self.groups > 1:
