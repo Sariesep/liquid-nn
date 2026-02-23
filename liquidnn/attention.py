@@ -182,24 +182,33 @@ class SlidingWindowAttention(nn.Module):
             q = _apply_rope(q, pos, self._rope_freqs)
             k_new = _apply_rope(k_new, pos, self._rope_freqs)
 
-        # ── KV Cache güncelle (FIFO) ────────────────────────────
+        # ── KV Cache güncelle (FIFO, autograd-safe) ─────────────
         if self._buf_len < self.window_size:
-            self._k_cache[:, :, self._buf_len] = k_new.squeeze(2)
-            self._v_cache[:, :, self._buf_len] = v_new.squeeze(2)
-            self._buffer[:, self._buf_len] = x
+            k_cache = self._k_cache.clone()
+            v_cache = self._v_cache.clone()
+            buf = self._buffer.clone()
+            k_cache[:, :, self._buf_len] = k_new.squeeze(2)
+            v_cache[:, :, self._buf_len] = v_new.squeeze(2)
+            buf[:, self._buf_len] = x
+            self._k_cache = k_cache
+            self._v_cache = v_cache
+            self._buffer = buf
             self._buf_len += 1
         else:
-            self._k_cache = torch.roll(self._k_cache, -1, dims=2)
-            self._v_cache = torch.roll(self._v_cache, -1, dims=2)
-            self._buffer = torch.roll(self._buffer, -1, dims=1)
-            self._k_cache[:, :, -1] = k_new.squeeze(2)
-            self._v_cache[:, :, -1] = v_new.squeeze(2)
-            self._buffer[:, -1] = x
+            k_cache = torch.roll(self._k_cache, -1, dims=2).clone()
+            v_cache = torch.roll(self._v_cache, -1, dims=2).clone()
+            buf = torch.roll(self._buffer, -1, dims=1).clone()
+            k_cache[:, :, -1] = k_new.squeeze(2)
+            v_cache[:, :, -1] = v_new.squeeze(2)
+            buf[:, -1] = x
+            self._k_cache = k_cache
+            self._v_cache = v_cache
+            self._buffer = buf
 
-        # ── Cache'ten K/V al ────────────────────────────────────
+        # ── Cache'ten K/V al (clone ile autograd-safe) ───────────
         seq_len = self._buf_len
-        k = self._k_cache[:, :, :seq_len]  # [B, Hkv, S, Dh]
-        v = self._v_cache[:, :, :seq_len]
+        k = self._k_cache[:, :, :seq_len].clone()  # [B, Hkv, S, Dh]
+        v = self._v_cache[:, :, :seq_len].clone()
 
         # GQA: KV head'lerini Q sayısına genişlet
         if self.groups > 1:
