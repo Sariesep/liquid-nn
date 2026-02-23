@@ -36,7 +36,8 @@ import json
 import sys, os
 
 sys.path.insert(0, os.path.abspath('.'))
-from liquidnn import MiniLiquidGPT, get_tokenizer
+from liquidnn import MiniLiquidGPT
+from liquidnn.tokenizer import TokenizerWrapper
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"🖥️  Cihaz: {device}")
@@ -48,7 +49,7 @@ if device.type == 'cuda':
 # ║  CELL 3: Dataset — WikiText veya Türkçe Veri                ║
 # ╚═══════════════════════════════════════════════════════════════╝
 
-tokenizer = get_tokenizer()
+tokenizer = TokenizerWrapper()
 
 # ── Seçenek A: HuggingFace WikiText-103 (İngilizce, ~500MB) ───
 # Küçük ama kaliteli, 2 saatte anlamlı sonuç verir
