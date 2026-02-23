@@ -12,6 +12,13 @@ Eklentiler:
   - Sliding-Window Attention (isteğe bağlı)
   - Mixture of Experts Router (isteğe bağlı)
   - Speculative Decoding (adaptive gamma + stochastic acceptance)
+
+v0.3.4 eklentileri:
+  - Nöromodülasyon (Meta-Plasticity)
+  - Homeostatik Plastisite
+  - Çift Hızlı Hebb (Multi-Timescale)
+  - MoE Expert Capacity Limiting
+  - Sinaptik Konsolidasyon
 """
 
 import math
@@ -25,6 +32,7 @@ from .ode_cell import LiquidODECell
 from .attention import SlidingWindowAttention
 from .moe import ExpertRouter
 from .rmsnorm import RMSNorm
+from .neuromodulation import Neuromodulator
 
 
 def _greedy_pick(logits: torch.Tensor, temperature: float = 1.0) -> torch.Tensor:
@@ -174,7 +182,15 @@ class MiniLiquidGPT(nn.Module):
                  use_rope: bool = False,
                  use_flash: bool = True,
                  use_multiscale: bool = False,
-                 tau_gate: bool = False):
+                 tau_gate: bool = False,
+                 # ── v0.3.4 ────────────────────────────
+                 use_neuromod: bool = False,
+                 use_homeostasis: bool = False,
+                 homeostasis_target: float = 0.5,
+                 use_dual_hebb: bool = False,
+                 use_consolidation: bool = False,
+                 consolidation_strength: float = 1.0,
+                 moe_capacity_factor: float = 0.0):
         super().__init__()
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
@@ -186,6 +202,7 @@ class MiniLiquidGPT(nn.Module):
         self.early_exit_threshold = early_exit_threshold
         self.use_multiscale = use_multiscale
         self.tau_gate = tau_gate
+        self.use_neuromod = use_neuromod
 
         # Norm sınıfı seçimi
         NormClass = RMSNorm if use_rmsnorm else nn.LayerNorm
@@ -204,16 +221,27 @@ class MiniLiquidGPT(nn.Module):
         self.drops = nn.ModuleList()
 
         for _ in range(num_fast):
-            self.cells.append(LiquidODECell(embed_dim, embed_dim,
-                                            ode_steps=fast_steps,
-                                            use_plasticity=False))
+            self.cells.append(LiquidODECell(
+                embed_dim, embed_dim,
+                ode_steps=fast_steps,
+                use_plasticity=False,
+                use_homeostasis=use_homeostasis,
+                target_avg=homeostasis_target,
+            ))
             self.norms.append(NormClass(embed_dim))
             self.drops.append(nn.Dropout(dropout))
 
         for _ in range(num_deep):
-            self.cells.append(LiquidODECell(embed_dim, embed_dim,
-                                            ode_steps=deep_steps,
-                                            use_plasticity=True))
+            self.cells.append(LiquidODECell(
+                embed_dim, embed_dim,
+                ode_steps=deep_steps,
+                use_plasticity=True,
+                use_homeostasis=use_homeostasis,
+                target_avg=homeostasis_target,
+                use_dual_hebb=use_dual_hebb,
+                use_consolidation=use_consolidation,
+                consolidation_strength=consolidation_strength,
+            ))
             self.norms.append(NormClass(embed_dim))
             self.drops.append(nn.Dropout(dropout))
 
@@ -234,8 +262,15 @@ class MiniLiquidGPT(nn.Module):
         if use_moe and self.num_layers > 1:
             self.router = ExpertRouter(
                 embed_dim, num_experts=self.num_layers,
-                top_k=min(moe_top_k, self.num_layers)
+                top_k=min(moe_top_k, self.num_layers),
+                capacity_factor=moe_capacity_factor,
             )
+
+        # Nöromodülatör (isteğe bağlı)
+        self._neuromod = None
+        self._mod_signal = 1.0
+        if use_neuromod:
+            self._neuromod = Neuromodulator(embed_dim)
 
         self._hiddens: Optional[List[torch.Tensor]] = None
 
@@ -291,13 +326,22 @@ class MiniLiquidGPT(nn.Module):
         if pos < self.pos_enc.size(1):
             x = x + self.pos_enc[0, pos]
 
+        # Nöromodülasyon sinyali
+        mod = self._mod_signal if self.use_neuromod else 1.0
+
         if self.router is not None:
             # MoE: top-k expert seçimi
-            weights, indices, aux_loss = self.router(x)
+            weights, indices, aux_loss, dropped_mask = self.router(x)
             self._aux_loss = self._aux_loss + aux_loss
             out = torch.zeros_like(x)
             for k_idx in range(weights.size(1)):
                 for b in range(B):
+                    # Capacity drop kontrolü
+                    if (dropped_mask is not None and
+                            dropped_mask[b, k_idx].item()):
+                        out[b:b+1] += weights[b, k_idx] * x[b:b+1]
+                        continue
+
                     eidx = indices[b, k_idx].item()
                     cell = self.cells[eidx]
                     norm = self.norms[eidx]
@@ -306,7 +350,8 @@ class MiniLiquidGPT(nn.Module):
                                  enable_plasticity,
                                  adaptive_steps=self.adaptive_ode,
                                  tau_gate_residual=self.tau_gate,
-                                 moe_weight=weights[b, k_idx].item())
+                                 moe_weight=weights[b, k_idx].item(),
+                                 mod_signal=mod)
                     h_new = norm(h_new + x[b:b+1])
                     h_new = drop(h_new)
 
@@ -333,7 +378,8 @@ class MiniLiquidGPT(nn.Module):
                 for i, cell, norm, drop in fast_cells:
                     h_new = cell(x_fast, self._hiddens[i], enable_plasticity,
                                  adaptive_steps=self.adaptive_ode,
-                                 tau_gate_residual=self.tau_gate)
+                                 tau_gate_residual=self.tau_gate,
+                                 mod_signal=mod)
                     h_new = norm(h_new + x_fast)
                     h_new = drop(h_new)
                     self._hiddens[i] = h_new
@@ -344,7 +390,8 @@ class MiniLiquidGPT(nn.Module):
                 for i, cell, norm, drop in deep_cells:
                     h_new = cell(x_deep, self._hiddens[i], enable_plasticity,
                                  adaptive_steps=self.adaptive_ode,
-                                 tau_gate_residual=self.tau_gate)
+                                 tau_gate_residual=self.tau_gate,
+                                 mod_signal=mod)
                     h_new = norm(h_new + x_deep)
                     h_new = drop(h_new)
                     self._hiddens[i] = h_new
@@ -360,7 +407,8 @@ class MiniLiquidGPT(nn.Module):
                         zip(self.cells, self.norms, self.drops)):
                     h_new = cell(x, self._hiddens[i], enable_plasticity,
                                  adaptive_steps=self.adaptive_ode,
-                                 tau_gate_residual=self.tau_gate)
+                                 tau_gate_residual=self.tau_gate,
+                                 mod_signal=mod)
                     h_new = norm(h_new + x)
                     h_new = drop(h_new)
                     self._hiddens[i] = h_new
@@ -382,6 +430,11 @@ class MiniLiquidGPT(nn.Module):
 
         x = self.out_norm(x)
         logits = F.linear(x, self.embed.weight)  # Weight tying
+
+        # ── Nöromodülasyon: prediction error → mod_signal ──────
+        if self._neuromod is not None and enable_plasticity:
+            with torch.no_grad():
+                self._mod_signal = self._neuromod(x)
         return logits
 
     def _forward_token_for_ckpt(self, token_id, pos, enable_plasticity):
@@ -808,6 +861,9 @@ class MiniLiquidGPT(nn.Module):
             info = cell.hebb_info
             stats[f'L{i}_ih'] = info['ih']
             stats[f'L{i}_hh'] = info['hh']
+            if 'ih_slow' in info:
+                stats[f'L{i}_ih_slow'] = info['ih_slow']
+                stats[f'L{i}_hh_slow'] = info['hh_slow']
         return stats
 
     def count_params(self) -> dict:

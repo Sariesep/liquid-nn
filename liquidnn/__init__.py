@@ -7,7 +7,7 @@ Liquid ODE Cells + Differentiable Hebbian Plasticity
 + Gradient Checkpointing + INT8 Quantization
 """
 
-__version__ = "0.3.3"
+__version__ = "0.3.4"
 
 from .plasticity import PlasticSynapse
 from .ode_cell import LiquidODECell
@@ -18,6 +18,7 @@ from .model import MiniLiquidGPT, AdaptiveGammaScheduler
 from .distillation import DistillationTrainer
 from .quantize import quantize_model, model_size_mb, benchmark_model
 from .tokenizer import get_tokenizer, TokenizerWrapper
+from .neuromodulation import Neuromodulator
 
 __all__ = [
     "PlasticSynapse",
@@ -33,5 +34,6 @@ __all__ = [
     "benchmark_model",
     "get_tokenizer",
     "TokenizerWrapper",
+    "Neuromodulator",
 ]
 

@@ -4,6 +4,7 @@ import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 import torch
+import torch.nn.functional as F
 from liquidnn import PlasticSynapse
 
 
@@ -39,14 +40,14 @@ def test_hebb_reset():
 
 
 def test_hebb_norm_bounded():
-    """Hebb normu W normunun %30'unu aşmamalı."""
+    """Hebb normu öğrenilebilir kapasiteyi aşmamalı."""
     syn = PlasticSynapse(64, 32)
     x = torch.randn(4, 64)
     for _ in range(100):
         y = syn(x)
         syn.update_hebb(x, y)
 
-    max_allowed = 0.3 * syn.W.data.norm().item()
+    max_allowed = F.softplus(syn.hebb_capacity).item()
     assert syn.hebb_norm <= max_allowed * 1.01, \
         f"Hebb norm {syn.hebb_norm:.4f} > limit {max_allowed:.4f}"
     print("✅ hebb_norm_bounded")

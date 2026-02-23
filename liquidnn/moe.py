@@ -7,8 +7,12 @@ sadece hızlı katmanlardan, zor tokenler derin katmanlardan geçer.
 
 Load balancing aux loss ile tüm expert'lerin dengeli
 kullanılması sağlanır (Switch Transformer, 2021).
+
+v0.3.4: Expert Capacity Limiting — her expert'in işleyebileceği
+        token sayısını sınırlayarak dengeli dağılım zorunlu kılar.
 """
 
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,14 +26,16 @@ class ExpertRouter(nn.Module):
     ve ağırlıklandırılmış çıktı üretir.
 
     Args:
-        embed_dim:    Gömme boyutu
-        num_experts:  Toplam expert (katman) sayısı
-        top_k:        Her token için seçilecek expert sayısı
-        noise_std:    Routing'e eklenen gürültü (eğitimde keşif için)
+        embed_dim:        Gömme boyutu
+        num_experts:      Toplam expert (katman) sayısı
+        top_k:            Her token için seçilecek expert sayısı
+        noise_std:        Routing'e eklenen gürültü (eğitimde keşif için)
+        capacity_factor:  Expert kapasite çarpanı (0 = sınırsız, >0 = aktif)
     """
 
     def __init__(self, embed_dim: int, num_experts: int,
-                 top_k: int = 2, noise_std: float = 0.1):
+                 top_k: int = 2, noise_std: float = 0.1,
+                 capacity_factor: float = 0.0):
         super().__init__()
         assert top_k <= num_experts, \
             f"top_k ({top_k}) num_experts'ten ({num_experts}) büyük olamaz"
@@ -37,6 +43,7 @@ class ExpertRouter(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.noise_std = noise_std
+        self.capacity_factor = capacity_factor
 
         # Router MLP: token vektöründen expert skorlarına
         self.gate = nn.Sequential(
@@ -53,10 +60,14 @@ class ExpertRouter(nn.Module):
             x: [B, D] token gömmesi
 
         Returns:
-            weights:  [B, top_k] seçilen expertlerin ağırlıkları (softmax)
-            indices:  [B, top_k] seçilen expert indeksleri
-            aux_loss: skaler load balancing kaybı
+            weights:      [B, top_k] seçilen expertlerin ağırlıkları (softmax)
+            indices:      [B, top_k] seçilen expert indeksleri
+            aux_loss:     skaler load balancing kaybı
+            dropped_mask: [B, top_k] bool, True = token bu expert'e gönderilmeyecek
+                          (capacity_factor=0 ise None)
         """
+        B = x.size(0)
+
         # Router skorları
         logits = self.gate(x)  # [B, num_experts]
 
@@ -73,7 +84,24 @@ class ExpertRouter(nn.Module):
         # (her expert'in eşit kullanılmasını teşvik eder)
         aux_loss = self._load_balance_loss(logits)
 
-        return weights, top_idx, aux_loss
+        # ── Expert Capacity Limiting ──────────────────────────────
+        dropped_mask = None
+        if self.capacity_factor > 0 and B > 0:
+            capacity = max(1, math.ceil(
+                B * self.top_k / self.num_experts * self.capacity_factor))
+            expert_counts = torch.zeros(self.num_experts, dtype=torch.long,
+                                        device=x.device)
+            dropped_mask = torch.zeros(B, self.top_k, dtype=torch.bool,
+                                       device=x.device)
+            for k_idx in range(self.top_k):
+                for b in range(B):
+                    eidx = top_idx[b, k_idx].item()
+                    if expert_counts[eidx] >= capacity:
+                        dropped_mask[b, k_idx] = True
+                    else:
+                        expert_counts[eidx] += 1
+
+        return weights, top_idx, aux_loss, dropped_mask
 
     def _load_balance_loss(self, logits: torch.Tensor) -> torch.Tensor:
         """
