@@ -10,6 +10,7 @@ Kullanım:
 
 import os
 import sys
+import json
 import math
 import time
 import inspect
@@ -178,6 +179,8 @@ def train(model, train_x, train_y, val_x, val_y, cfg, save_dir):
             'val_loss_on': val_on, 'ppl_on': ppl_on,
             'hebb': deep_h,
         })
+        # Her epoch'ta kaydet — oturum düşerse eğriler kaybolmasın
+        save_history(history, os.path.join(save_dir, 'history.json'))
 
         # En iyi model seçimi: iki modun iyisi (model hangi modda
         # kullanılacaksa o modda iyi olmalı)
@@ -212,9 +215,28 @@ def main():
     cfg = load_config(args.config)
     print(f"📋 Config: {args.config}")
 
+    # Tekrarlanabilirlik: seed (training.seed, varsayılan 42)
+    seed = cfg.get('training', {}).get('seed', 42)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    print(f"🎲 Seed: {seed}")
+
     # Ortam
     device = setup_device()
     save_dir = setup_drive(cfg['save'].get('dir', './checkpoints/'))
+
+    # Koşu metadata'sı — hangi kod/config/seed ile koşulduğu kayda geçsin
+    meta = {'seed': seed, 'config_file': args.config, 'config': cfg,
+            'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')}
+    try:
+        import subprocess
+        meta['git_commit'] = subprocess.run(
+            ['git', 'rev-parse', 'HEAD'], capture_output=True,
+            text=True, timeout=5).stdout.strip()
+    except Exception:
+        pass
+    with open(os.path.join(save_dir, 'run_meta.json'), 'w') as f:
+        json.dump(meta, f, indent=2, default=str)
 
     # Tokenizer
     tokenizer = TokenizerWrapper()

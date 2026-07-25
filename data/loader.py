@@ -40,16 +40,28 @@ def load_data(tokenizer, max_tokens=200_000, seq_len=128, device='cpu'):
 
 
 def _try_wikitext() -> str:
-    """Wikitext-2 yüklemeyi dene."""
+    """Wikitext-2 yüklemeyi dene.
+
+    Yeni datasets sürümleri 'namespace/name' formatı istiyor
+    (Salesforce/wikitext); eski sürümler için düz ad da denenir.
+    """
     try:
         from datasets import load_dataset
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-        text = "\n".join([t for t in ds["text"] if len(t.strip()) > 50])
-        print(f"   Wikitext-2: {len(text):,} karakter")
-        return text
-    except Exception as e:
+    except ImportError as e:
         print(f"   Wikitext yüklenemedi: {e}")
         return None
+
+    last_err = None
+    for repo in ("Salesforce/wikitext", "wikitext"):
+        try:
+            ds = load_dataset(repo, "wikitext-2-raw-v1", split="train")
+            text = "\n".join([t for t in ds["text"] if len(t.strip()) > 50])
+            print(f"   Wikitext-2 ({repo}): {len(text):,} karakter")
+            return text
+        except Exception as e:
+            last_err = e
+    print(f"   Wikitext yüklenemedi: {last_err}")
+    return None
 
 
 def _try_shakespeare() -> str:

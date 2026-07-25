@@ -55,16 +55,21 @@ def save_model(model: MiniLiquidGPT, path: str, config: dict = None):
 
 
 def load_model(path: str, device='cpu') -> MiniLiquidGPT:
-    """Kaydedilmiş modeli yükle."""
+    """Kaydedilmiş modeli yükle.
+
+    train.py checkpoint'leri config'i iç içe kaydeder ({'model': {...}});
+    düz sözlük de desteklenir. Tüm geçerli model anahtarları (use_attention
+    vb. bayraklar dahil) modele geçirilir — aksi halde v0.3.5 checkpoint'i
+    çıplak modele yüklenmeye çalışılıp state_dict hatası verirdi.
+    """
+    import inspect
+
     state = torch.load(path, map_location=device, weights_only=True)
     cfg = state.get('config', {})
+    mc = cfg.get('model', cfg)  # iç içe veya düz format
+    valid = set(inspect.signature(MiniLiquidGPT.__init__).parameters) - {'self'}
     model = MiniLiquidGPT(
-        vocab_size=cfg.get('vocab_size', 50257),
-        embed_dim=cfg.get('embed_dim', 256),
-        num_fast=cfg.get('num_fast', 2),
-        num_deep=cfg.get('num_deep', 2),
-        fast_steps=cfg.get('fast_steps', 1),
-        deep_steps=cfg.get('deep_steps', 3),
+        **{k: v for k, v in mc.items() if k in valid}
     ).to(device)
     model.load_state_dict(state['model_state_dict'])
     print(f"📂 Model yüklendi: {path}")

@@ -56,7 +56,8 @@ tokenizer = TokenizerWrapper()
 try:
     from datasets import load_dataset
     print("📥 WikiText-103 indiriliyor...")
-    ds = load_dataset("wikitext", "wikitext-103-raw-v1", split="train")
+    ds = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1",
+                      split="train")
     raw_text = "\n".join([t for t in ds["text"] if len(t.strip()) > 50])
     # İlk ~10MB'ı al (2 saatlik eğitim için yeterli)
     MAX_CHARS = 10_000_000
