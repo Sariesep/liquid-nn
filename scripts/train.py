@@ -146,14 +146,14 @@ def train(model, train_x, train_y, val_x, val_y, cfg, save_dir):
             n_batch += 1
             del logits, loss
 
-        # Epoch sonu — val iki modda ölçülür (plastisite OFF ve ON)
+        # Epoch sonu — Hebb izleri eval'den ÖNCE okunmalı
+        # (evaluate() izleri sıfırlar, sonra okunursa H̄ hep 0 çıkar)
         train_loss = total_loss / max(n_batch, 1)
+        hs = model.hebb_stats()
         val_off, val_on = evaluate_both(model, val_x, val_y)
         ppl_off = math.exp(min(val_off, 20))
         ppl_on = math.exp(min(val_on, 20))
         elapsed = time.time() - t0
-
-        hs = model.hebb_stats()
         deep_h = sum(v for k, v in hs.items()
                      if int(k[1]) >= cfg['model'].get('num_fast', 2)) / 4
         phase = "B" if enable_plast else "A"
