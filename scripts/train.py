@@ -37,8 +37,9 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def evaluate(model, val_x, val_y, batch_size=8, max_batches=30):
-    """Validation loss."""
+def evaluate(model, val_x, val_y, batch_size=8, max_batches=30,
+             enable_plasticity=False):
+    """Validation loss (tek modda)."""
     model.eval()
     total, n = 0.0, 0
     N = val_x.size(0)
@@ -49,12 +50,28 @@ def evaluate(model, val_x, val_y, batch_size=8, max_batches=30):
             x = val_x[i:i+batch_size]
             y = val_y[i:i+batch_size]
             model.reset_hebb()
-            logits = model(x, enable_plasticity=False, chunk_size=32)
+            logits = model(x, enable_plasticity=enable_plasticity,
+                           chunk_size=32)
             loss = F.cross_entropy(logits.reshape(-1, model.vocab_size),
                                    y.reshape(-1))
             total += loss.item()
             n += 1
+    model.reset_hebb()
     return total / max(n, 1)
+
+
+def evaluate_both(model, val_x, val_y, batch_size=8, max_batches=30):
+    """
+    Validation'ı iki modda ölç: plastisite OFF (statik) ve ON (plastik).
+
+    Projenin ana tezi çıkarım anındaki plastisitenin faydası olduğundan
+    yalnızca OFF ölçmek tezi görünmez kılar; ikisi de raporlanır.
+    """
+    val_off = evaluate(model, val_x, val_y, batch_size, max_batches,
+                       enable_plasticity=False)
+    val_on = evaluate(model, val_x, val_y, batch_size, max_batches,
+                      enable_plasticity=True)
+    return val_off, val_on
 
 
 def train(model, train_x, train_y, val_x, val_y, cfg, save_dir):
@@ -129,10 +146,11 @@ def train(model, train_x, train_y, val_x, val_y, cfg, save_dir):
             n_batch += 1
             del logits, loss
 
-        # Epoch sonu
+        # Epoch sonu — val iki modda ölçülür (plastisite OFF ve ON)
         train_loss = total_loss / max(n_batch, 1)
-        val_loss = evaluate(model, val_x, val_y)
-        ppl = math.exp(min(val_loss, 20))
+        val_off, val_on = evaluate_both(model, val_x, val_y)
+        ppl_off = math.exp(min(val_off, 20))
+        ppl_on = math.exp(min(val_on, 20))
         elapsed = time.time() - t0
 
         hs = model.hebb_stats()
@@ -141,14 +159,21 @@ def train(model, train_x, train_y, val_x, val_y, cfg, save_dir):
         phase = "B" if enable_plast else "A"
 
         print(f"  [{phase}] Ep {epoch+1:2d}/{epochs} │ "
-              f"train:{train_loss:.3f} val:{val_loss:.3f} ppl:{ppl:.1f} │ "
+              f"train:{train_loss:.3f} │ "
+              f"val OFF:{val_off:.3f} (ppl {ppl_off:.1f}) "
+              f"ON:{val_on:.3f} (ppl {ppl_on:.1f}) │ "
               f"H̄={deep_h:.4f} │ {elapsed:.0f}s")
 
         history.append({
             'epoch': epoch + 1, 'train_loss': train_loss,
-            'val_loss': val_loss, 'ppl': ppl, 'hebb': deep_h,
+            'val_loss_off': val_off, 'ppl_off': ppl_off,
+            'val_loss_on': val_on, 'ppl_on': ppl_on,
+            'hebb': deep_h,
         })
 
+        # En iyi model seçimi: iki modun iyisi (model hangi modda
+        # kullanılacaksa o modda iyi olmalı)
+        val_loss = min(val_off, val_on)
         if val_loss < best_val:
             best_val = val_loss
             save_model(model, os.path.join(save_dir, 'best_model.pt'), cfg)
