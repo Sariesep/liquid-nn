@@ -22,20 +22,29 @@ A language model research project built from scratch, based on Liquid Time-Const
 | **Adaptation** | Requires fine-tuning (hours) | Real-time (milliseconds) |
 | **Computation** | Fixed depth | Adaptive ODE steps (easy→fast, hard→deep) |
 
-### Architecture
+### Architecture (v0.3.5)
 
 ```
 Token → Embed(50257, 256) + SinPosEnc
   → LiquidODE × 2 (steps=1, Euler — fast perception)
   → LiquidODE × 2 (steps=3, RK2 + Hebb — deep reasoning)
-  → Head (weight-tied) → Logits
+  → Head (weight-tied, fused) → Logits
 ```
+
+Optional components, all off by default and enabled via config flags:
+Sliding-Window Attention (RoPE, KV cache, Flash, GQA), SwiGLU FFN,
+MoE router with capacity limiting, neuromodulation, homeostatic
+plasticity, dual-rate Hebb, synaptic consolidation, RMSNorm,
+tau-gated residual, speculative decoding, INT8 quantization.
+
+- Bare baseline: **~14.7M params** (`configs/ablation_baseline.yaml`)
+- Full v0.3.5: **~17.5M params** (`configs/base.yaml`)
 
 ## 🚀 Quick Start
 
 ```bash
 # Clone
-git clone https://github.com/YOUR_USERNAME/liquid-nn.git
+git clone https://github.com/Sariesep/liquid-nn.git
 cd liquid-nn
 
 # Install dependencies
@@ -49,12 +58,15 @@ python scripts/generate.py --checkpoint checkpoints/best_model.pt --prompt "The 
 
 # Plasticity test
 python scripts/plasticity_test.py --checkpoint checkpoints/best_model.pt
+
+# Training throughput benchmark
+python scripts/benchmark.py
 ```
 
 ### Run on Google Colab
 
 ```python
-!git clone https://github.com/YOUR_USERNAME/liquid-nn.git
+!git clone https://github.com/Sariesep/liquid-nn.git
 %cd liquid-nn
 !pip install -r requirements.txt
 !python scripts/train.py --config configs/colab_t4.yaml
@@ -64,55 +76,52 @@ python scripts/plasticity_test.py --checkpoint checkpoints/best_model.pt
 
 ```
 liquid-nn/
-├── liquidnn/                # Main library (pip installable)
-│   ├── __init__.py
-│   ├── plasticity.py        # PlasticSynapse — Hebbian learning
-│   ├── ode_cell.py          # LiquidODECell — Liquid neuron
-│   ├── model.py             # MiniLiquidGPT — Main model
-│   ├── tokenizer.py         # tiktoken wrapper
-│   └── utils.py             # Utility functions
-├── configs/                 # Training configurations
-│   ├── base.yaml            # Default settings
-│   ├── colab_t4.yaml        # Colab T4 optimized
-│   ├── small.yaml           # Quick experiments (~5M params)
-│   └── large.yaml           # Large model (~50M params)
-├── scripts/                 # Executable scripts
-│   ├── train.py             # Training
-│   ├── generate.py          # Text generation
-│   ├── plasticity_test.py   # ZEPHYR / Bloop test
-│   └── benchmark.py         # Performance measurement
-├── data/                    # Data loading
-│   └── loader.py
-├── tests/                   # Unit tests
-│   ├── test_plasticity.py
-│   ├── test_ode_cell.py
-│   └── test_model.py
-├── notebooks/               # Jupyter notebooks
-│   ├── 01_quickstart.ipynb
-│   ├── 02_plasticity_demo.ipynb
-│   └── 03_training.ipynb
-├── docs/                    # Documentation
-│   ├── architecture.md
-│   └── plasticity.md
-├── checkpoints/             # Model weights (not in git)
-├── requirements.txt
-├── setup.py
-├── pyproject.toml
-├── .gitignore
-├── LICENSE
-└── README.md
+├── liquidnn/                  # Main library (pip installable)
+│   ├── plasticity.py          # PlasticSynapse — Hebbian learning
+│   ├── ode_cell.py            # LiquidODECell — Liquid neuron
+│   ├── model.py               # MiniLiquidGPT — Main model
+│   ├── attention.py           # Sliding-window attention (RoPE/KV/Flash/GQA)
+│   ├── ffn.py                 # SwiGLU feed-forward
+│   ├── moe.py                 # Mixture-of-Experts router
+│   ├── neuromodulation.py     # Prediction-error neuromodulator
+│   ├── rmsnorm.py             # RMSNorm
+│   ├── distillation.py        # Teacher→student distillation
+│   ├── quantize.py            # INT8 dynamic quantization
+│   ├── tokenizer.py           # tiktoken wrapper
+│   └── utils.py               # Save/load, device setup
+├── configs/
+│   ├── base.yaml              # Full v0.3.5 model (all flags on)
+│   ├── colab_t4.yaml          # Same, checkpoints to Google Drive
+│   ├── ablation_baseline.yaml # Bare Liquid ODE + Hebb (ablation)
+│   ├── small.yaml             # Quick experiments
+│   └── large.yaml             # Large model
+├── scripts/
+│   ├── train.py               # Training (dual-mode validation, AMP)
+│   ├── generate.py            # Text generation
+│   ├── plasticity_test.py     # ZEPHYR persistence test
+│   └── benchmark.py           # Throughput/VRAM measurement
+├── data/
+│   └── loader.py              # Wikitext-2 (Shakespeare fallback)
+├── notebooks/
+│   ├── colab_demo_v034.py     # Colab demo cells
+│   └── colab_train_2h.py      # 2-hour Colab training run
+├── tests/                     # 100 unit tests (pytest)
+├── docs/
+│   └── architecture.md
+└── checkpoints/               # Model weights (not in git)
 ```
 
 ## 📊 Results
 
 | Metric | Value |
 |---|---|
-| Parameters | ~14M |
-| Val Perplexity | ... |
-| Plasticity ON vs OFF | ... |
-| ZEPHYR Persistence | ... |
+| Parameters | 14.7M (bare) / 17.5M (full) |
+| Val Perplexity | *ablation in progress* |
+| Plasticity ON vs OFF | *ablation in progress* |
+| ZEPHYR Persistence | *pending trained checkpoint* |
 
-*Results will be updated as training completes.*
+*The plasticity ON/OFF ablation is currently running; this table will be
+filled with measured numbers, not projections.*
 
 ## 🔬 Research Notes
 
@@ -129,7 +138,7 @@ MIT License — Use, modify, and share as you like.
 
 Pull requests are welcome! Help is especially needed on:
 - [ ] Larger datasets (TinyStories, Cosmopedia)
-- [ ] Multi-head plasticity
+- [ ] Matched-parameter transformer baseline for fair comparison
 - [ ] Benchmark comparisons (GPT-2 small vs Liquid)
 - [ ] ONNX/TensorRT export
 - [ ] Mobile deployment (CoreML, NNAPI)
