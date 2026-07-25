@@ -87,7 +87,12 @@ def train(model, train_x, train_y, val_x, val_y, cfg, save_dir):
     num_batches = N // batch_size
     device = train_x.device
 
-    print(f"\n🔬 Eğitim: {epochs} epoch × {num_batches} batch")
+    # AMP: cuda'da varsayılan açık (training.amp: false ile kapatılır)
+    use_amp = tc.get('amp', True) and device.type == 'cuda'
+    scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+
+    print(f"\n🔬 Eğitim: {epochs} epoch × {num_batches} batch"
+          f"{'  │  AMP aktif' if use_amp else ''}")
 
     # Optimizer
     plast_names = {'alpha', 'log_eta', 'logit_decay'}
@@ -127,19 +132,22 @@ def train(model, train_x, train_y, val_x, val_y, cfg, save_dir):
             model.reset_hebb()
             optimizer.zero_grad(set_to_none=True)
 
-            logits = model(x, enable_plasticity=enable_plast,
-                           chunk_size=chunk_size)
-            loss = F.cross_entropy(logits.reshape(-1, model.vocab_size),
-                                   y.reshape(-1))
+            with torch.amp.autocast('cuda', enabled=use_amp):
+                logits = model(x, enable_plasticity=enable_plast,
+                               chunk_size=chunk_size)
+                loss = F.cross_entropy(logits.reshape(-1, model.vocab_size),
+                                       y.reshape(-1))
 
             if torch.isnan(loss):
                 print(f"  ⚠️ NaN! ep={epoch+1} batch={bi+1}")
                 continue
 
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), max_norm=tc.get('grad_clip', 1.0))
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             total_loss += loss.item()
