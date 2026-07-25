@@ -113,15 +113,27 @@ liquid-nn/
 
 ## 📊 Results
 
+First plasticity ablation (2026-07-25). Bare baseline
+(`configs/ablation_baseline.yaml`), Tiny Shakespeare 200k tokens,
+10 epochs, Colab T4, no seeds (pre-seed code):
+
 | Metric | Value |
 |---|---|
 | Parameters | 14.7M (bare) / 17.5M (full) |
-| Val Perplexity | *ablation in progress* |
-| Plasticity ON vs OFF | *ablation in progress* |
-| ZEPHYR Persistence | *pending trained checkpoint* |
+| Val ppl — control (plasticity never on) | **190.2** (loss 5.248) |
+| Val ppl — plasticity in epochs 6-10 | **192.3** (loss 5.259) |
+| Inference-time plasticity (val ON vs OFF) | Δloss ≈ 0.002 — **no measurable benefit** |
+| Phase-B training overhead | **+28%** wall-clock per epoch |
+| ZEPHYR Persistence | *pending* |
 
-*The plasticity ON/OFF ablation is currently running; this table will be
-filled with measured numbers, not projections.*
+**Honest reading:** at this scale, on in-distribution next-token
+prediction, Hebbian plasticity contributed nothing measurable. Open
+questions under investigation: (1) did the plasticity parameters
+(`alpha`/`eta`) actually move from their near-zero init, or was 5
+epochs of phase B too short to engage the mechanism? (2) is
+in-distribution perplexity the wrong metric — plasticity's claim is
+*adaptation* (distribution shift, ZEPHYR-style novel-token learning),
+which these numbers do not test.
 
 ## 🔬 Research Notes
 
