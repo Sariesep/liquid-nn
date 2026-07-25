@@ -47,7 +47,10 @@ def test_hebb_norm_bounded():
         y = syn(x)
         syn.update_hebb(x, y)
 
-    max_allowed = F.softplus(syn.hebb_capacity).item()
+    # Sınır formülü büyüme faktörü içerir: cap * (1 + 0.1*log1p(adım))
+    import math
+    growth = 1.0 + 0.1 * math.log1p(100)
+    max_allowed = F.softplus(syn.hebb_capacity).item() * growth
     assert syn.hebb_norm <= max_allowed * 1.01, \
         f"Hebb norm {syn.hebb_norm:.4f} > limit {max_allowed:.4f}"
     print("✅ hebb_norm_bounded")
