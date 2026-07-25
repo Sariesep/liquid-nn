@@ -12,6 +12,7 @@ import os
 import sys
 import math
 import time
+import inspect
 import argparse
 
 # Proje kökünü path'e ekle
@@ -186,18 +187,22 @@ def main():
     tokenizer = TokenizerWrapper()
     print(f"📝 Tokenizer: {tokenizer.vocab_size} token")
 
-    # Model
+    # Model — config'teki tüm model anahtarlarını doğrudan geçir
+    # (use_attention, use_ffn, use_neuromod vb. bayraklar dahil)
     mc = cfg['model']
+    valid_keys = set(inspect.signature(MiniLiquidGPT.__init__).parameters) - {'self'}
+    unknown = set(mc) - valid_keys
+    if unknown:
+        print(f"⚠️  Config'te bilinmeyen model anahtarları (yok sayıldı): {sorted(unknown)}")
     model = MiniLiquidGPT(
-        vocab_size=mc['vocab_size'],
-        embed_dim=mc['embed_dim'],
-        num_fast=mc['num_fast'],
-        num_deep=mc['num_deep'],
-        fast_steps=mc['fast_steps'],
-        deep_steps=mc['deep_steps'],
-        dropout=mc['dropout'],
-        max_seq=mc.get('max_seq', 512),
+        **{k: v for k, v in mc.items() if k in valid_keys}
     ).to(device)
+
+    flags = sorted(k for k, v in mc.items() if k.startswith('use_') and v)
+    if flags:
+        print(f"🔧 Aktif bayraklar: {', '.join(flags)}")
+    else:
+        print("🔧 Aktif bayrak yok — çıplak Liquid ODE + Hebb (baseline)")
 
     p = model.count_params()
     print(f"🧠 Model: {p['total']/1e6:.1f}M param "

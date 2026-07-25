@@ -1,5 +1,5 @@
-# MiniLiquidGPT — Colab T4 optimize
-# Ücretsiz Colab'da güvenli çalışır
+# MiniLiquidGPT v0.3.5 — Colab T4 optimize
+# Ücretsiz Colab'da güvenli çalışır, checkpoint'ler Drive'a yazılır
 
 model:
   vocab_size: 50257
@@ -10,6 +10,25 @@ model:
   deep_steps: 3
   dropout: 0.1
   max_seq: 512
+  # ── Attention ──
+  use_attention: true
+  attn_heads: 4
+  attn_window: 64
+  use_rope: true
+  use_flash: true
+  # ── FFN (v0.3.5) ──
+  use_ffn: true
+  ffn_mult: 4.0
+  # ── Biyolojik plastisite (v0.3.4) ──
+  use_neuromod: true
+  use_homeostasis: true
+  homeostasis_target: 0.5
+  use_dual_hebb: true
+  use_consolidation: true
+  consolidation_strength: 1.0
+  # ── Diğer ──
+  use_rmsnorm: true
+  tau_gate: true
 
 training:
   epochs: 10
