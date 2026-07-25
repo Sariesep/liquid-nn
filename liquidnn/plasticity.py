@@ -55,9 +55,12 @@ class PlasticSynapse(nn.Module):
         self.b = nn.Parameter(torch.zeros(out_dim))
 
         # Plastisite kontrolleri — Fast Hebb (eğitimle öğrenilir)
+        # v0.4 başlangıç değerleri: ilk ablasyonda eta≈0.0015 ve yarı ömür
+        # ~5 token ile mekanizma fiilen ölü doğuyordu. Yeni init:
+        # eta ≈ 0.0094, decay ≈ 0.989 (yarı ömür ~20 token).
         self.alpha = nn.Parameter(0.01 * torch.randn(out_dim, in_dim))
-        self.log_eta = nn.Parameter(torch.tensor(-3.0))
-        self.logit_decay = nn.Parameter(torch.tensor(3.0))
+        self.log_eta = nn.Parameter(torch.tensor(-1.0))
+        self.logit_decay = nn.Parameter(torch.tensor(4.5))
         self.hebb_capacity = nn.Parameter(torch.tensor(2.0))
         self.register_buffer('_hebb_steps', torch.tensor(0))
 
@@ -68,8 +71,8 @@ class PlasticSynapse(nn.Module):
         if use_dual_hebb:
             self.alpha_slow = nn.Parameter(
                 0.005 * torch.randn(out_dim, in_dim))
-            self.log_eta_slow = nn.Parameter(torch.tensor(-5.0))
-            self.logit_decay_slow = nn.Parameter(torch.tensor(5.0))
+            self.log_eta_slow = nn.Parameter(torch.tensor(-3.0))
+            self.logit_decay_slow = nn.Parameter(torch.tensor(6.0))
             self.register_buffer('Hebb_slow', None)
 
         # ── Sinaptik Konsolidasyon ─────────────────────────────────
@@ -95,11 +98,19 @@ class PlasticSynapse(nn.Module):
 
         return F.linear(x, W_eff.to(x.dtype), self.b.to(x.dtype))
 
-    @torch.no_grad()
     def update_hebb(self, pre: torch.Tensor, post: torch.Tensor,
                     moe_weight: float = 1.0, mod_signal: float = 1.0):
         """
-        Hebbian güncelleme (opsiyonel top-k sparsification ile).
+        Hebbian güncelleme (opsiyonel top-k sparsification ile) —
+        v0.4'ten itibaren TÜREVLENEBİLİR (Miconi 2018 ile uyumlu).
+
+        Eski @torch.no_grad() dekoratörü iz yazma yolunu grafikten
+        koparıyordu: eta/decay/hebb_capacity hiç gradyan alamıyor,
+        yalnızca alpha (okuma kazancı) öğreniliyordu — ilk ablasyonun
+        "katkı yok" sonucunun kök nedeni. Artık iz zinciri chunk içinde
+        grafiğe dahil; truncated BPTT sınırlarında detach_hebb() keser.
+        Çıkarım zaten torch.no_grad() altında çağırdığı için ek maliyet
+        yok.
 
         pre:  Presinaptik aktivasyon [B, in_dim]
         post: Postsinaptik aktivasyon [B, out_dim]
@@ -126,13 +137,20 @@ class PlasticSynapse(nn.Module):
                                     device=pre.device, dtype=torch.float32)
 
         # ── Sinaptik Konsolidasyon: önemli izleri koru ─────────────
+        # importance bir EMA istatistiği, öğrenilebilir yol değil —
+        # bilinçli olarak grafik DIŞINDA tutulur (aksi halde epoch
+        # boyunca hesap grafiği biriktirip bellek sızdırırdı)
         if self.use_consolidation:
-            if self._importance is None:
-                self._importance = torch.zeros_like(outer)
-            # EMA importance: tutarlı büyük Hebb*alpha değerleri önemli
-            self._importance = (0.99 * self._importance +
-                                0.01 * (self.Hebb * self.alpha).abs())
-            # Update mask: önemli → düşük güncelleme
+            with torch.no_grad():
+                if self._importance is None:
+                    self._importance = torch.zeros(
+                        self.out_dim, self.in_dim, device=pre.device,
+                        dtype=torch.float32)
+                # EMA importance: tutarlı büyük Hebb*alpha değerleri önemli
+                self._importance = (
+                    0.99 * self._importance +
+                    0.01 * (self.Hebb.detach() * self.alpha.detach()).abs())
+            # Update mask: önemli → düşük güncelleme (sabit katsayı)
             update_mask = 1.0 / (1.0 + self._importance *
                                  self.consolidation_strength)
             outer = outer * update_mask

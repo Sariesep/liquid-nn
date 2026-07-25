@@ -159,6 +159,13 @@ def test_consolidation_protects_important():
     syn_cons = PlasticSynapse(16, 16, use_consolidation=True,
                                consolidation_strength=5.0)
     syn_cons.load_state_dict(syn_free.state_dict(), strict=False)
+
+    # Test edilen özellik kapasite doygunluğu ALTINDAKİ rejime ait —
+    # v0.4'ün sıcak eta başlangıcı 60 güncellemede sınırı bağlayıp
+    # global ölçeklemeyle drift karşılaştırmasını bozuyor; eta'yı
+    # bu test için eski sessiz değere sabitle
+    for s in (syn_free, syn_cons):
+        s.log_eta.data.fill_(-3.0)
     
     # Aynı kalıbı 30 kez öğret (önemli iz oluştur)
     pre1 = torch.randn(1, 16)

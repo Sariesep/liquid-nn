@@ -95,8 +95,9 @@ def train(model, train_x, train_y, val_x, val_y, cfg, save_dir):
     print(f"\n🔬 Eğitim: {epochs} epoch × {num_batches} batch"
           f"{'  │  AMP aktif' if use_amp else ''}")
 
-    # Optimizer
-    plast_names = {'alpha', 'log_eta', 'logit_decay'}
+    # Optimizer — plastisite parametreleri ayrı grupta (yüksek LR, WD yok)
+    # v0.4: update_hebb artık türevlenebilir; hebb_capacity de gradyan alır
+    plast_names = {'alpha', 'log_eta', 'logit_decay', 'hebb_capacity'}
     plast_p = [p for n, p in model.named_parameters()
                if any(pn in n for pn in plast_names)]
     other_p = [p for n, p in model.named_parameters()

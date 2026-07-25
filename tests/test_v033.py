@@ -19,14 +19,16 @@ def test_hebb_capacity_independent_of_w():
     syn.W.data.zero_()  # W normu 0 olursa eski mantıkta plastisite de 0 olurdu
     assert syn.W.data.norm() == 0.0
 
-    # Kapasite varsayılanı ~0.69 (softplus(1.0))
-    expected_cap = F.softplus(syn.hebb_capacity).item()
-    
+    # Sınır formülü büyüme faktörü içerir: cap * (1 + 0.1*log1p(adım))
+    import math
+    growth = 1.0 + 0.1 * math.log1p(1)
+    expected_cap = F.softplus(syn.hebb_capacity).item() * growth
+
     pre = torch.randn(1, 10)
     post = torch.randn(1, 10) * 100  # Çok büyük güncelleme
-    
+
     syn.update_hebb(pre, post)
-    
+
     # Norm sıfır olmamalı, kapasitede kırpılmış olmalı
     actual_norm = syn.Hebb.norm().item()
     assert actual_norm > 0.0, "Hebb güncellenmeli (W=0 olsa bile)"

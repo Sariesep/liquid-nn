@@ -7,7 +7,7 @@ Liquid ODE Cells + Differentiable Hebbian Plasticity
 + Gradient Checkpointing + INT8 Quantization
 """
 
-__version__ = "0.3.5"
+__version__ = "0.4.0"  # türevlenebilir plastisite (Miconi 2018 uyumlu)
 
 from .plasticity import PlasticSynapse
 from .ode_cell import LiquidODECell
