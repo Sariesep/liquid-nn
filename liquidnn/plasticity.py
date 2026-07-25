@@ -77,9 +77,11 @@ class PlasticSynapse(nn.Module):
             self.register_buffer('_importance', None)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # İzler her zaman fp32 — AMP altında x fp16 gelse bile küçük
+        # eta çarpanlarının hassasiyeti korunur (matmul'u autocast yönetir)
         if self.Hebb is None:
             self.Hebb = torch.zeros(self.out_dim, self.in_dim,
-                                    device=x.device, dtype=x.dtype)
+                                    device=x.device, dtype=torch.float32)
 
         W_eff = self.W + self.alpha * self.Hebb
 
@@ -87,10 +89,11 @@ class PlasticSynapse(nn.Module):
         if self.use_dual_hebb:
             if self.Hebb_slow is None:
                 self.Hebb_slow = torch.zeros(self.out_dim, self.in_dim,
-                                             device=x.device, dtype=x.dtype)
+                                             device=x.device,
+                                             dtype=torch.float32)
             W_eff = W_eff + self.alpha_slow * self.Hebb_slow
 
-        return F.linear(x, W_eff, self.b)
+        return F.linear(x, W_eff.to(x.dtype), self.b.to(x.dtype))
 
     @torch.no_grad()
     def update_hebb(self, pre: torch.Tensor, post: torch.Tensor,
@@ -106,6 +109,10 @@ class PlasticSynapse(nn.Module):
         decay = torch.sigmoid(self.logit_decay)
         eta = F.softplus(self.log_eta) * 0.03 * mod_signal
 
+        # İz birikimi fp32'de yapılır (AMP altında pre/post fp16 gelebilir)
+        pre = pre.float()
+        post = post.float()
+
         if pre.dim() == 2:
             outer = torch.einsum('bi,bj->ij', post, pre) / max(pre.size(0), 1)
         else:
@@ -116,7 +123,7 @@ class PlasticSynapse(nn.Module):
 
         if self.Hebb is None:
             self.Hebb = torch.zeros(self.out_dim, self.in_dim,
-                                    device=pre.device, dtype=pre.dtype)
+                                    device=pre.device, dtype=torch.float32)
 
         # ── Sinaptik Konsolidasyon: önemli izleri koru ─────────────
         if self.use_consolidation:
@@ -133,12 +140,14 @@ class PlasticSynapse(nn.Module):
         self.Hebb = decay * self.Hebb + eta * outer
 
         # Adaptif norm sınırı: zaman içinde büyüyen kapasite
+        # Branchless ölçekleme — .item()/bool karşılaştırması GPU'yu her
+        # güncellemede senkronize ediyordu (token başına ~12 kez)
         self._hebb_steps += 1
-        growth = 1.0 + 0.1 * torch.log1p(self._hebb_steps.float()).item()
+        growth = 1.0 + 0.1 * torch.log1p(self._hebb_steps.float())
         h_norm = self.Hebb.norm()
         max_norm = F.softplus(self.hebb_capacity) * growth
-        if h_norm > max_norm:
-            self.Hebb = self.Hebb * (max_norm / (h_norm + 1e-8))
+        self.Hebb = self.Hebb * torch.clamp(max_norm / (h_norm + 1e-8),
+                                            max=1.0)
 
         # Top-k sparsification (fast)
         if self.sparse_k > 0:
@@ -158,15 +167,15 @@ class PlasticSynapse(nn.Module):
             if self.Hebb_slow is None:
                 self.Hebb_slow = torch.zeros(self.out_dim, self.in_dim,
                                              device=pre.device,
-                                             dtype=pre.dtype)
+                                             dtype=torch.float32)
 
             # Aynı outer product (konsolidasyon uygulanmış), farklı hız
             self.Hebb_slow = decay_slow * self.Hebb_slow + eta_slow * outer * moe_weight
 
-            # Aynı kapasite sınırı
+            # Aynı kapasite sınırı (branchless)
             hs_norm = self.Hebb_slow.norm()
-            if hs_norm > max_norm:
-                self.Hebb_slow = self.Hebb_slow * (max_norm / (hs_norm + 1e-8))
+            self.Hebb_slow = self.Hebb_slow * torch.clamp(
+                max_norm / (hs_norm + 1e-8), max=1.0)
 
     def reset_hebb(self):
         """Plastik izleri sıfırla."""

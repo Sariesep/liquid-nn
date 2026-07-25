@@ -322,7 +322,8 @@ class MiniLiquidGPT(nn.Module):
         self._aux_loss = torch.tensor(0.0, device=device)
 
     def forward_token(self, token_id: torch.Tensor, pos: int,
-                      enable_plasticity: bool = True) -> torch.Tensor:
+                      enable_plasticity: bool = True,
+                      compute_logits: bool = True) -> torch.Tensor:
         """
         Tek token işle.
 
@@ -330,9 +331,11 @@ class MiniLiquidGPT(nn.Module):
             token_id: [B] token ID'leri
             pos: Sekans pozisyonu
             enable_plasticity: Hebb güncellemesi aktif mi
+            compute_logits: False → logit matmul'u atlanır (forward()
+                            sekans sonunda toplu hesaplar); None döner
 
         Returns:
-            [B, V] logits
+            [B, V] logits (compute_logits=True) veya None
         """
         if token_id.dim() > 1:
             token_id = token_id.squeeze(-1)
@@ -448,7 +451,7 @@ class MiniLiquidGPT(nn.Module):
                         if confidence.item() > self.early_exit_threshold:
                             break
 
-        # Embedding'i kaydet (training attention için)
+        # Embedding'i kaydet (training attention + toplu logit için)
         self._last_embed = x
 
         # Sliding-Window Attention
@@ -456,6 +459,10 @@ class MiniLiquidGPT(nn.Module):
         # Inference'da: tek token KV cache ile
         if self.attn is not None and not self.training:
             x = self.attn(x, pos=pos)
+
+        # Toplu logit yolu: vokab matmul'u forward() sonunda tek seferde
+        if not compute_logits:
+            return None
 
         x = self.out_norm(x)
         logits = F.linear(x, self.embed.weight)  # Weight tying
@@ -494,6 +501,14 @@ class MiniLiquidGPT(nn.Module):
         # Checkpointing: daha sık detach = daha az VRAM tüketimi
         detach_freq = max(1, chunk_size // 2) if use_checkpointing else chunk_size
 
+        # Toplu logit yolu (fused head): token başına [B, V] vokab matmul'u
+        # yerine sekans sonunda tek matmul — hem hızlı hem çok daha az bellek.
+        # Per-token logit gerektiren iki durum dışında hep kullanılır:
+        #   - nöromodülasyon (mod sinyali her token'ın çıktısından türer)
+        #   - eval'de attention (KV cache token token işler)
+        fused_head = (self._neuromod is None and
+                      (self.attn is None or self.training))
+
         all_logits = []
         all_embeds = []
         for t in range(T):
@@ -503,11 +518,19 @@ class MiniLiquidGPT(nn.Module):
                 for cell in self.cells:
                     cell.detach_hebb()
 
-            logits = self.forward_token(input_ids[:, t], t, enable_plasticity)
-            all_logits.append(logits)
+            logits = self.forward_token(input_ids[:, t], t, enable_plasticity,
+                                        compute_logits=not fused_head)
+            if not fused_head:
+                all_logits.append(logits)
             all_embeds.append(self._last_embed)
 
-        # Eğitim modunda attention: tüm sekans üzerinde full-sequence causal
+        if fused_head:
+            embed_seq = torch.stack(all_embeds, dim=1)  # [B, T, D]
+            if self.attn is not None and self.training:
+                embed_seq = self.attn(embed_seq, pos=0)  # full-seq causal
+            return F.linear(self.out_norm(embed_seq), self.embed.weight)
+
+        # Per-token yol (nöromodülasyon veya eval+attention)
         logits_stack = torch.stack(all_logits, dim=1)  # [B, T, V]
 
         if self.attn is not None and self.training:
