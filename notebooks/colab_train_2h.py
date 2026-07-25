@@ -173,17 +173,37 @@ def make_batch(data, seq_len, batch_size):
     return x, y
 
 @torch.no_grad()
-def evaluate(model, val_data, seq_len, n_batches=10):
-    """Validasyon loss hesapla."""
+def evaluate(model, val_data, seq_len, n_batches=10,
+             enable_plasticity=False):
+    """Validasyon loss hesapla (tek modda).
+
+    Her batch öncesi Hebb izleri sıfırlanır — eğitimden sızan izler
+    val loss'u son eğitim batch'ine bağımlı kılıyordu.
+    """
     model.eval()
     total_loss = 0
     for _ in range(n_batches):
         x, y = make_batch(val_data, seq_len, 4)
-        logits = model(x, enable_plasticity=False, chunk_size=seq_len)
+        model.reset_hebb()
+        logits = model(x, enable_plasticity=enable_plasticity,
+                       chunk_size=seq_len)
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), y.view(-1))
         total_loss += loss.item()
+    model.reset_hebb()
     model.train()
     return total_loss / n_batches
+
+
+def evaluate_both(model, val_data, seq_len, n_batches=10):
+    """Val'i iki modda ölç: plastisite OFF (statik) ve ON (plastik).
+
+    Projenin ana tezi çıkarım anındaki plastisite olduğundan
+    yalnızca OFF ölçmek tezi görünmez kılar."""
+    val_off = evaluate(model, val_data, seq_len, n_batches,
+                       enable_plasticity=False)
+    val_on = evaluate(model, val_data, seq_len, n_batches,
+                      enable_plasticity=True)
+    return val_off, val_on
 
 def save_checkpoint(model, optimizer, step, loss, path):
     """Checkpoint'ı Google Drive'a kaydet."""
@@ -279,15 +299,18 @@ try:
                   f"Hebb: {hebb_max:.2f} │ "
                   f"{steps_per_sec:.1f} it/s │ ETA: {eta_hours:.1f}h")
 
-        # ── Validasyon ────────────────────────────────────────
+        # ── Validasyon (iki modda: plastisite OFF ve ON) ──────
         if step % VAL_EVERY == 0:
-            val_loss = evaluate(model, val_data, SEQ_LEN)
-            val_ppl = math.exp(min(val_loss, 20))
-            val_losses.append((step, val_loss))
+            val_off, val_on = evaluate_both(model, val_data, SEQ_LEN)
+            val_loss = min(val_off, val_on)
+            ppl_off = math.exp(min(val_off, 20))
+            ppl_on = math.exp(min(val_on, 20))
+            val_losses.append((step, val_off, val_on))
             improved = "🏆 BEST" if val_loss < best_val_loss else ""
             print(f"  {'─' * 45}")
-            print(f"  📋 VAL Step {step}: Loss={val_loss:.4f} "
-                  f"PPL={val_ppl:.1f} {improved}")
+            print(f"  📋 VAL Step {step}: "
+                  f"OFF={val_off:.4f} (PPL {ppl_off:.1f}) │ "
+                  f"ON={val_on:.4f} (PPL {ppl_on:.1f}) {improved}")
             print(f"  {'─' * 45}")
 
             if val_loss < best_val_loss:
