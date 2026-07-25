@@ -1,0 +1,39 @@
+# MiniLiquidGPT — Ablasyon Baseline
+# Çıplak model: sadece Liquid ODE + Hebbian plastisite.
+# Tüm ekstralar (attention, FFN, neuromod, homeostasis, MoE, RMSNorm) KAPALI.
+#
+# Amaç: Projenin ana tezini ölçmek.
+#   1) Bu config ile eğit → val perplexity kaydet (plastisite ON)
+#   2) Aynı config, phase_split: 1.0 ile eğit → plastisite hiç açılmaz (OFF)
+#   3) İki eğriyi karşılaştır — fark, Hebbian plastisitenin gerçek katkısıdır.
+# Özellik katkıları bu baseline'a göre teker teker ölçülmeli (base.yaml'a bakın).
+
+model:
+  vocab_size: 50257
+  embed_dim: 256
+  num_fast: 2
+  num_deep: 2
+  fast_steps: 1
+  deep_steps: 3
+  dropout: 0.1
+  max_seq: 512
+  # Bayrak yok — model.py varsayılanları zaten hepsi kapalı;
+  # burada açıkça belirtmiyoruz ki baseline'ın çıplaklığı garantili kalsın.
+
+training:
+  epochs: 10
+  batch_size: 8
+  lr: 1.0e-3
+  chunk_size: 16
+  grad_clip: 1.0
+  weight_decay: 1.0e-4
+  plast_lr_mult: 3.0
+  phase_split: 0.5       # OFF-koşusu için 1.0 yapın (plastisite hiç açılmaz)
+
+data:
+  max_tokens: 200000
+  seq_len: 128
+
+save:
+  dir: ./checkpoints/ablation_baseline/
+  save_every: 2

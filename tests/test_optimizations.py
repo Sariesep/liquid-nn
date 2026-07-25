@@ -168,11 +168,12 @@ def test_moe_routing():
     """ExpertRouter top-k seçim yapmalı."""
     router = ExpertRouter(embed_dim=32, num_experts=4, top_k=2)
     x = torch.randn(2, 32)
-    weights, indices, aux_loss = router(x)
+    weights, indices, aux_loss, dropped_mask = router(x)
 
     assert weights.shape == (2, 2)
     assert indices.shape == (2, 2)
     assert aux_loss.item() >= 0
+    assert dropped_mask is None  # capacity_factor=0 → sınırsız
     # Ağırlıklar toplamı ~1 olmalı
     w_sums = weights.sum(dim=-1)
     assert torch.allclose(w_sums, torch.ones(2), atol=0.01)
@@ -184,7 +185,7 @@ def test_moe_load_balance():
     router = ExpertRouter(embed_dim=32, num_experts=4, top_k=2)
     router.train()
     x = torch.randn(8, 32)
-    _, _, aux_loss = router(x)
+    _, _, aux_loss, _ = router(x)
     assert aux_loss.item() > 0, "Aux loss sıfır olmamalı"
     print("✅ moe_load_balance")
 
