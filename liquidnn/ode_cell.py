@@ -32,6 +32,8 @@ class LiquidODECell(nn.Module):
         use_dual_hebb:         Çift hızlı Hebb aktif mi (PlasticSynapse'e iletilir)
         use_consolidation:     Sinaptik konsolidasyon aktif mi
         consolidation_strength: Konsolidasyon gücü
+        plast_rule:            Yazma kuralı: 'hebb' | 'delta'
+        plast_channel_gate:    Kanal başına unutma kapısı (KDA tarzı)
     """
 
     def __init__(self, input_dim: int, hidden_dim: int, ode_steps: int = 3,
@@ -39,7 +41,9 @@ class LiquidODECell(nn.Module):
                  use_homeostasis: bool = False, target_avg: float = 0.5,
                  use_dual_hebb: bool = False,
                  use_consolidation: bool = False,
-                 consolidation_strength: float = 1.0):
+                 consolidation_strength: float = 1.0,
+                 plast_rule: str = 'hebb',
+                 plast_channel_gate: bool = False):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.ode_steps = ode_steps
@@ -52,12 +56,16 @@ class LiquidODECell(nn.Module):
             use_dual_hebb=use_dual_hebb,
             use_consolidation=use_consolidation,
             consolidation_strength=consolidation_strength,
+            update_rule=plast_rule,
+            channel_gate=plast_channel_gate,
         )
         self.syn_hh = PlasticSynapse(
             hidden_dim, hidden_dim,
             use_dual_hebb=use_dual_hebb,
             use_consolidation=use_consolidation,
             consolidation_strength=consolidation_strength,
+            update_rule=plast_rule,
+            channel_gate=plast_channel_gate,
         )
 
         self.tau_net = nn.Sequential(
