@@ -174,6 +174,11 @@ class MiniLiquidGPT(nn.Module):
         attn_window:    Attention pencere boyutu
         use_moe:        Mixture of Experts Router aktif mi
         moe_top_k:      MoE: her token için seçilecek expert sayısı
+        plast_rule:     Plastik iz yazma kuralı — 'hebb' (toplamsal
+                        Hebbian) veya 'delta' (hata düzeltmeli delta
+                        kuralı; DeltaNet/KDA ailesi)
+        plast_channel_gate: Kanal başına unutma kapısı (KDA'nın ince
+                        taneli gating katkısı); False → skaler decay
     """
 
     def __init__(self, vocab_size: int = 50257, embed_dim: int = 256,
@@ -199,8 +204,13 @@ class MiniLiquidGPT(nn.Module):
                  consolidation_strength: float = 1.0,
                  moe_capacity_factor: float = 0.0,
                  use_ffn: bool = False,
-                 ffn_mult: float = 4.0):
+                 ffn_mult: float = 4.0,
+                 # ── v0.5: yazma kuralı ────────────────
+                 plast_rule: str = 'hebb',
+                 plast_channel_gate: bool = False):
         super().__init__()
+        self.plast_rule = plast_rule
+        self.plast_channel_gate = plast_channel_gate
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
         self.num_layers = num_fast + num_deep
@@ -251,6 +261,8 @@ class MiniLiquidGPT(nn.Module):
                 use_dual_hebb=use_dual_hebb,
                 use_consolidation=use_consolidation,
                 consolidation_strength=consolidation_strength,
+                plast_rule=plast_rule,
+                plast_channel_gate=plast_channel_gate,
             ))
             self.norms.append(NormClass(embed_dim))
             self.drops.append(nn.Dropout(dropout))

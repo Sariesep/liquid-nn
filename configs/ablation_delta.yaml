@@ -1,0 +1,48 @@
+# MiniLiquidGPT — Ablasyon: DELTA yazma kuralı
+#
+# ablation_baseline.yaml ile BİREBİR aynı model; tek fark yazma kuralı.
+# Karşılaştırma üç kollu koşulur:
+#
+#   1) ablation_baseline.yaml                  → Hebbian kural, plastisite ON
+#   2) ablation_baseline.yaml + phase_split:1  → kontrol (plastisite hiç yok)
+#   3) ablation_delta.yaml (bu dosya)          → delta kuralı, plastisite ON
+#
+# Delta kuralı (DeltaNet / Gated DeltaNet / Kimi Delta Attention ailesi):
+#   H ← g⊙H + β·((post − (g⊙H)·k̂) ⊗ k̂)
+# Yazmadan önce anahtarın mevcut karşılığını okur, yalnızca hatayı yazar.
+# Hebbian'ın aksine çağrışımları harmanlamaz, üzerine yazar.
+#
+# plast_channel_gate: KDA'nın ince taneli gating katkısı — tek skaler
+# decay yerine girdi kanalı başına öğrenilmiş unutma kapısı.
+
+model:
+  vocab_size: 50257
+  embed_dim: 256
+  num_fast: 2
+  num_deep: 2
+  fast_steps: 1
+  deep_steps: 3
+  dropout: 0.1
+  max_seq: 512
+  # ── Yazma kuralı (tek fark bu) ──
+  plast_rule: delta
+  plast_channel_gate: true
+
+training:
+  epochs: 10
+  batch_size: 8
+  lr: 1.0e-3
+  chunk_size: 16
+  grad_clip: 1.0
+  weight_decay: 1.0e-4
+  plast_lr_mult: 3.0
+  phase_split: 0.5
+  seed: 42
+
+data:
+  max_tokens: 200000
+  seq_len: 128
+
+save:
+  dir: ./checkpoints/ablation_delta/
+  save_every: 2

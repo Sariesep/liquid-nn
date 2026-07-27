@@ -1,10 +1,10 @@
 """
-Diferansiyel Plastik Sinapslar — Hebbian Öğrenme
+Diferansiyel Plastik Sinapslar — Öğrenilebilir Yazma Kuralları
 
 W_eff = W_base + α ⊙ Hebb
 
 W_base: Eğitimle öğrenilen sabit ağırlıklar
-Hebb:   Her forward pass'te güncellenen plastik iz
+Hebb:   Her forward pass'te güncellenen plastik iz (hızlı ağırlık)
 α:      Hangi sinapsların ne kadar plastik olduğunu belirler
 
 v0.3.4 eklentileri:
@@ -12,7 +12,28 @@ v0.3.4 eklentileri:
   - Sinaptik Konsolidasyon (önemli izleri koruma)
   - Nöromodülasyon desteği (mod_signal ile eta ölçekleme)
 
-"Birlikte ateşleyen nöronlar birbirine bağlanır" — Donald Hebb, 1949
+v0.5 — İki yazma kuralı (update_rule):
+
+  'hebb'  : H ← decay·H + η·(post ⊗ pre)
+            Saf toplamsal Hebbian birikim. Aynı anahtara ikinci kez
+            yazınca eskisi silinmez; izler birbirine karışır ve tek
+            çare tüm izi eşit oranda soldurmaktır.
+            "Birlikte ateşleyen nöronlar birbirine bağlanır" — Hebb, 1949
+
+  'delta' : H ← g⊙H + β·((post − (g⊙H)·k̂) ⊗ k̂),  k̂ = pre/‖pre‖
+            Hata düzeltmeli delta kuralı (Widrow-Hoff 1960). Yazmadan
+            önce o anahtarın MEVCUT karşılığını okur ve yalnızca farkı
+            (hatayı) yazar → eski çağrışım hedefe doğru güncellenir,
+            karışma yerine üzerine yazma olur. DeltaNet / Gated DeltaNet
+            ve Kimi Delta Attention (KDA) bu aileden gelir; K3'ün
+            hafızası da bu kuralla yazılıyor.
+
+  channel_gate=True (KDA'nın katkısı): tek skaler decay yerine girdi
+  kanalı başına öğrenilmiş unutma kapısı [in_dim] — her çağrışım kendi
+  hızında solar, "hepsini birden unut" kısıtı kalkar.
+
+Bu ikisi eş koşullarda karşılaştırılabilsin diye aynı sınıfta duruyor:
+projenin açık araştırma sorusu "hangi yazma kuralı ne zaman kazanıyor".
 """
 
 import torch
@@ -34,19 +55,32 @@ class PlasticSynapse(nn.Module):
         use_dual_hebb:         Çift hızlı Hebb (fast + slow) aktif mi
         use_consolidation:     Sinaptik konsolidasyon aktif mi
         consolidation_strength: Konsolidasyon gücü (yüksek → daha dirençli)
+        update_rule:           'hebb' (toplamsal) | 'delta' (hata düzeltmeli)
+        channel_gate:          Kanal başına unutma kapısı (KDA tarzı ince
+                               taneli gating); False → tek skaler decay
     """
+
+    VALID_RULES = ('hebb', 'delta')
 
     def __init__(self, in_dim: int, out_dim: int, sparse_k: int = 0,
                  use_dual_hebb: bool = False,
                  use_consolidation: bool = False,
-                 consolidation_strength: float = 1.0):
+                 consolidation_strength: float = 1.0,
+                 update_rule: str = 'hebb',
+                 channel_gate: bool = False):
         super().__init__()
+        if update_rule not in self.VALID_RULES:
+            raise ValueError(
+                f"update_rule '{update_rule}' geçersiz; "
+                f"geçerli değerler: {self.VALID_RULES}")
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.sparse_k = sparse_k  # 0 = tam yoğun, >0 = top-k sparse
         self.use_dual_hebb = use_dual_hebb
         self.use_consolidation = use_consolidation
         self.consolidation_strength = consolidation_strength
+        self.update_rule = update_rule
+        self.channel_gate = channel_gate
 
         # Sabit ağırlıklar (tüm modellerde var)
         self.W = nn.Parameter(torch.empty(out_dim, in_dim))
@@ -60,9 +94,24 @@ class PlasticSynapse(nn.Module):
         # eta ≈ 0.0094, decay ≈ 0.989 (yarı ömür ~20 token).
         self.alpha = nn.Parameter(0.01 * torch.randn(out_dim, in_dim))
         self.log_eta = nn.Parameter(torch.tensor(-1.0))
-        self.logit_decay = nn.Parameter(torch.tensor(4.5))
         self.hebb_capacity = nn.Parameter(torch.tensor(2.0))
         self.register_buffer('_hebb_steps', torch.tensor(0))
+
+        # Unutma kapısı: skaler (klasik) veya kanal başına (KDA tarzı).
+        # İkisi de logit uzayında; sigmoid(4.5) ≈ 0.989 → yarı ömür ~20 token.
+        if channel_gate:
+            self.logit_decay = nn.Parameter(torch.full((in_dim,), 4.5))
+        else:
+            self.logit_decay = nn.Parameter(torch.tensor(4.5))
+
+        # Delta kuralının yazma oranı β ∈ (0,1): 1 → çağrışımı tamamen
+        # üzerine yaz, 0 → hiç yazma. sigmoid(0) = 0.5 ile başlar.
+        if update_rule == 'delta':
+            self.logit_beta = nn.Parameter(torch.tensor(0.0))
+
+        # Norm sınırı ölçeği — delta'nın doğal çalışma normu √in_dim ile
+        # büyür; Hebbian'da sınır regülatör olduğu için ölçek 1.0 kalır.
+        self._norm_scale = in_dim ** 0.5 if update_rule == 'delta' else 1.0
 
         # Plastik iz (fast)
         self.register_buffer('Hebb', None)
@@ -112,58 +161,66 @@ class PlasticSynapse(nn.Module):
         Çıkarım zaten torch.no_grad() altında çağırdığı için ek maliyet
         yok.
 
-        pre:  Presinaptik aktivasyon [B, in_dim]
-        post: Postsinaptik aktivasyon [B, out_dim]
+        pre:  Presinaptik aktivasyon [B, in_dim]  (delta kuralında "anahtar")
+        post: Postsinaptik aktivasyon [B, out_dim] (delta kuralında "değer")
         moe_weight: Bu expert'in seçilme ağırlığı (MoE router'dan gelir)
         mod_signal: Nöromodülasyon sinyali (meta-plasticity)
         """
+        # decay: skaler veya [in_dim] — [out,in] ize son eksende yayılır
         decay = torch.sigmoid(self.logit_decay)
-        eta = F.softplus(self.log_eta) * 0.03 * mod_signal
 
         # İz birikimi fp32'de yapılır (AMP altında pre/post fp16 gelebilir)
         pre = pre.float()
         post = post.float()
-
-        if pre.dim() == 2:
-            outer = torch.einsum('bi,bj->ij', post, pre) / max(pre.size(0), 1)
-        else:
-            outer = torch.outer(post.squeeze(), pre.squeeze())
-
-        # MoE ağırlığı ile plastisiteyi ölçeklendir
-        outer = outer * moe_weight
+        if pre.dim() == 1:
+            pre = pre.unsqueeze(0)
+        if post.dim() == 1:
+            post = post.unsqueeze(0)
+        B = max(pre.size(0), 1)
 
         if self.Hebb is None:
             self.Hebb = torch.zeros(self.out_dim, self.in_dim,
                                     device=pre.device, dtype=torch.float32)
 
-        # ── Sinaptik Konsolidasyon: önemli izleri koru ─────────────
-        # importance bir EMA istatistiği, öğrenilebilir yol değil —
-        # bilinçli olarak grafik DIŞINDA tutulur (aksi halde epoch
-        # boyunca hesap grafiği biriktirip bellek sızdırırdı)
-        if self.use_consolidation:
-            with torch.no_grad():
-                if self._importance is None:
-                    self._importance = torch.zeros(
-                        self.out_dim, self.in_dim, device=pre.device,
-                        dtype=torch.float32)
-                # EMA importance: tutarlı büyük Hebb*alpha değerleri önemli
-                self._importance = (
-                    0.99 * self._importance +
-                    0.01 * (self.Hebb.detach() * self.alpha.detach()).abs())
-            # Update mask: önemli → düşük güncelleme (sabit katsayı)
-            update_mask = 1.0 / (1.0 + self._importance *
-                                 self.consolidation_strength)
-            outer = outer * update_mask
+        if self.update_rule == 'delta':
+            # ── Delta kuralı (DeltaNet / KDA ailesi) ───────────────
+            # Anahtarı birim normla — delta kuralının kararlılığı
+            # ‖k‖=1 varsayımına dayanır (aksi halde β etkin oranı
+            # girdi büyüklüğüyle ölçeklenip patlar).
+            k = F.normalize(pre, dim=-1, eps=1e-6)
+            beta = torch.sigmoid(self.logit_beta) * mod_signal * moe_weight
 
-        self.Hebb = decay * self.Hebb + eta * outer
+            # Önce solma (gated delta rule), sonra hata düzeltmesi
+            H_decayed = self.Hebb * decay
+            # O anahtarın izde ŞU ANDA karşılığı ne? → hatayı ondan çıkar
+            retrieved = F.linear(k, H_decayed)          # [B, out_dim]
+            err = post - retrieved                      # yazılacak düzeltme
+            outer = torch.einsum('bi,bj->ij', err, k) / B
+            outer = self._consolidate(outer, pre.device)
+            self.Hebb = H_decayed + beta * outer
+        else:
+            # ── Hebbian kural (toplamsal birikim) ─────────────────
+            eta = F.softplus(self.log_eta) * 0.03 * mod_signal
+            outer = torch.einsum('bi,bj->ij', post, pre) / B
+            outer = outer * moe_weight
+            outer = self._consolidate(outer, pre.device)
+            self.Hebb = decay * self.Hebb + eta * outer
 
         # Adaptif norm sınırı: zaman içinde büyüyen kapasite
         # Branchless ölçekleme — .item()/bool karşılaştırması GPU'yu her
         # güncellemede senkronize ediyordu (token başına ~12 kez)
+        #
+        # Delta kuralında sınır REGÜLATÖR değil GÜVENLİK VALFİdir:
+        # kural matematiksel olarak kendi kendini sınırlar (ölçüldü: norm
+        # platoya oturuyor, ~√in_dim ile ölçekleniyor). Sabit skaler sınır
+        # uygulanırsa her kırpma tüm matrisi küçültür, delta ise en son
+        # anahtarı tam güce geri yazar → eski çağrışımlar sistematik
+        # olarak silinir (dik anahtarlarda bile A-hatırlama 1.00→0.29).
+        # Bu yüzden delta modunda sınır √in_dim ile ölçeklenir.
         self._hebb_steps += 1
         growth = 1.0 + 0.1 * torch.log1p(self._hebb_steps.float())
         h_norm = self.Hebb.norm()
-        max_norm = F.softplus(self.hebb_capacity) * growth
+        max_norm = F.softplus(self.hebb_capacity) * growth * self._norm_scale
         self.Hebb = self.Hebb * torch.clamp(max_norm / (h_norm + 1e-8),
                                             max=1.0)
 
@@ -178,6 +235,10 @@ class PlasticSynapse(nn.Module):
                 self.Hebb = self.Hebb * mask
 
         # ── Slow Hebb güncellemesi ─────────────────────────────────
+        # Yavaş iz her zaman toplamsal Hebbian birikimdir: görevi uzun
+        # vadeli istatistik tutmak, tekil çağrışımı düzeltmek değil.
+        # update_rule yalnızca hızlı izi belirler — karşılaştırma o iz
+        # üzerinde yapılıyor.
         if self.use_dual_hebb:
             decay_slow = torch.sigmoid(self.logit_decay_slow)
             eta_slow = F.softplus(self.log_eta_slow) * 0.01 * mod_signal
@@ -187,13 +248,44 @@ class PlasticSynapse(nn.Module):
                                              device=pre.device,
                                              dtype=torch.float32)
 
-            # Aynı outer product (konsolidasyon uygulanmış), farklı hız
-            self.Hebb_slow = decay_slow * self.Hebb_slow + eta_slow * outer * moe_weight
+            outer_slow = torch.einsum('bi,bj->ij', post, pre) / B
+            outer_slow = self._consolidate(outer_slow, pre.device,
+                                           update_ema=False)
+            self.Hebb_slow = (decay_slow * self.Hebb_slow +
+                              eta_slow * outer_slow * moe_weight)
 
             # Aynı kapasite sınırı (branchless)
             hs_norm = self.Hebb_slow.norm()
             self.Hebb_slow = self.Hebb_slow * torch.clamp(
                 max_norm / (hs_norm + 1e-8), max=1.0)
+
+    def _consolidate(self, outer: torch.Tensor, device,
+                     update_ema: bool = True) -> torch.Tensor:
+        """
+        Sinaptik konsolidasyon maskesi: önemli izler değişime direnir.
+
+        importance bir EMA istatistiği, öğrenilebilir yol değil —
+        bilinçli olarak grafik DIŞINDA tutulur (aksi halde chunk boyunca
+        hesap grafiği biriktirip bellek sızdırırdı).
+        """
+        if not self.use_consolidation:
+            return outer
+
+        with torch.no_grad():
+            if self._importance is None:
+                self._importance = torch.zeros(
+                    self.out_dim, self.in_dim, device=device,
+                    dtype=torch.float32)
+            if update_ema:
+                # Tutarlı büyük Hebb*alpha değerleri önemli sayılır
+                self._importance = (
+                    0.99 * self._importance +
+                    0.01 * (self.Hebb.detach() * self.alpha.detach()).abs())
+
+        # Önemli → düşük güncelleme (sabit katsayı, gradyan taşımaz)
+        update_mask = 1.0 / (1.0 + self._importance *
+                             self.consolidation_strength)
+        return outer * update_mask
 
     def reset_hebb(self):
         """Plastik izleri sıfırla."""
@@ -223,7 +315,10 @@ class PlasticSynapse(nn.Module):
 
     def extra_repr(self) -> str:
         parts = [f'in={self.in_dim}, out={self.out_dim}',
+                 f'rule={self.update_rule}',
                  f'hebb_norm={self.hebb_norm:.4f}']
+        if self.channel_gate:
+            parts.append('channel_gate')
         if self.use_dual_hebb:
             parts.append(f'hebb_slow_norm={self.hebb_slow_norm:.4f}')
         if self.use_consolidation:
